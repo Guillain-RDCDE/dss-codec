@@ -25,6 +25,18 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let header_size = version * DSS_BLOCK_SIZE;
     let num_blocks = (data.len() - header_size) / DSS_BLOCK_SIZE;
 
+    // Byte 4 of a block header selects the frame size. DssParser.dll indexes a
+    // table with it: mode 0 gives 328 bits, i.e. the 41-byte SP frame this
+    // decoder handles. The other modes are shorter frames belonging to other
+    // codecs (mode 2 is 192 bits, as written by older DS4000 recorders), and
+    // decoding them as SP yields noise rather than an error, so refuse them.
+    if num_blocks > 0 {
+        let mode = data[header_size + 4];
+        if mode != 0 {
+            return Err(DecodeError::UnsupportedDssMode(mode));
+        }
+    }
+
     let mut blocks = Vec::with_capacity(num_blocks);
     let mut total_frames: usize = 0;
 
