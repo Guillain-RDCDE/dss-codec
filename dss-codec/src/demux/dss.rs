@@ -16,16 +16,70 @@ struct BlockInfo {
     payload: Vec<u8>,
 }
 
+/// Un fichier DSS dont l'en-tete a ete perdu commence directement par ses blocs
+/// audio. Le seul moyen sur de le reconnaitre est la structure : sur chaque
+/// bloc, l'octet 3 vaut 0xFF, l'octet 4 donne le mode, et surtout la
+/// continuation qu'un bloc laisse doit etre exactement celle que le suivant
+/// annonce. Cette chaine ne tient pas par hasard : dix blocs de suite suffisent.
+pub fn looks_like_headerless_dss(data: &[u8]) -> bool {
+    const A_VERIFIER: usize = 24;
+    let blocs = data.len() / DSS_BLOCK_SIZE;
+    if blocs < A_VERIFIER {
+        return false;
+    }
+    let payload = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE;
+    let mut report = 0usize;
+    let mut liens = 0usize;
+    let mut tenus = 0usize;
+    for bi in 0..A_VERIFIER {
+        let h = &data[bi * DSS_BLOCK_SIZE..bi * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE];
+        if h[3] != 0xff || h[4] != 0 || h[2] as usize > 13 {
+            return false;
+        }
+        let swap = ((h[0] >> 7) & 1) as usize;
+        let cont = (2 * h[1] as usize + 2 * swap).saturating_sub(DSS_BLOCK_HEADER_SIZE);
+        if h[2] == 0 {
+            report = 0;
+            continue;
+        }
+        if bi > 0 {
+            liens += 1;
+            if cont == report {
+                tenus += 1;
+            }
+        }
+        let mut p = cont;
+        let mut sw = swap;
+        for _ in 0..h[2] {
+            p += if sw != 0 { 40 } else { DSS_SP_FRAME_SIZE };
+            sw ^= 1;
+        }
+        report = p.saturating_sub(payload);
+    }
+    // Une coupure de prise rompt legitimement la chaine ; du hasard ne la tient
+    // jamais. Quatre cinquiemes des liens suffisent a trancher.
+    liens >= 12 && tenus * 5 >= liens * 4
+}
+
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     // Byte 0 is the header size in 512-byte blocks. Two and three are what the
     // common recorders write, but others use a larger header, and refusing them
     // sent the file down the DS2 path where it failed with a misleading message.
-    if data.len() < 4 || data[1..4] != *b"dss" || data[0] == 0 || data[0] > 32 {
+    // Byte 0 is the header size in 512-byte blocks. Two and three are what the
+    // common recorders write, but others use a larger header, and refusing them
+    // sent the file down the DS2 path where it failed with a misleading message.
+    let entete_valide =
+        data.len() >= 4 && data[1..4] == *b"dss" && data[0] > 0 && data[0] <= 32;
+    let sans_entete = !entete_valide && looks_like_headerless_dss(data);
+    if !entete_valide && !sans_entete {
         return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
     }
 
-    let version = data[0] as usize;
-    let header_size = version * DSS_BLOCK_SIZE;
+    let header_size = if sans_entete {
+        0
+    } else {
+        data[0] as usize * DSS_BLOCK_SIZE
+    };
     let num_blocks = (data.len() - header_size) / DSS_BLOCK_SIZE;
 
     // Byte 4 of a block header selects the frame size, through the table
