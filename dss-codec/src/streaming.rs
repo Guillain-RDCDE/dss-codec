@@ -211,6 +211,10 @@ impl StreamingDecoder {
                     Some(ActiveDemuxer::Grundig(GrundigSpStreamDemuxer::new(header_blocks)));
                 self.decoder = Some(ActiveDecoder::Grundig(GrundigSpDecoder::new()));
             }
+            AudioFormat::DssLp => {
+                // Ces trames sont du G.723.1, pas le codec SP : rien a brancher
+                // ici, decode() renvoie une erreur qui le dit.
+            }
         }
     }
 

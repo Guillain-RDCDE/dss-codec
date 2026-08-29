@@ -28,15 +28,15 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let header_size = version * DSS_BLOCK_SIZE;
     let num_blocks = (data.len() - header_size) / DSS_BLOCK_SIZE;
 
-    // Byte 4 of a block header selects the frame size. DssParser.dll indexes a
-    // table with it: mode 0 gives 328 bits, i.e. the 41-byte SP frame this
-    // decoder handles. The other modes are shorter frames belonging to other
-    // codecs (mode 2 is 192 bits, as written by older DS4000 recorders), and
-    // decoding them as SP yields noise rather than an error, so refuse them.
+    // Byte 4 of a block header selects the frame size, through the table
+    // DssParser.dll indexes with it. Mode 0 is the 328-bit, 41-byte SP frame
+    // this decoder implements. The other modes carry G.723.1 instead: mode 2 is
+    // its 192-bit (24-byte) frame, modes 3 and 5 add the 32-bit SID frame.
+    // Reading those as SP produces noise, so name them for what they are.
     if num_blocks > 0 {
         let mode = data[header_size + 4];
         if mode != 0 {
-            return Err(DecodeError::UnsupportedDssMode(mode));
+            return Err(DecodeError::DssLp(mode));
         }
     }
 

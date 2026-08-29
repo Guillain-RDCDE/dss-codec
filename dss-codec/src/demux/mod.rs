@@ -18,6 +18,11 @@ pub enum AudioFormat {
     Ds2Qp7,
     /// Grundig DSS file (first byte 6, magic "dss"), SP codec at 16000 Hz output
     GrundigSp,
+    /// DSS file whose blocks announce a frame mode other than 0. Those frames
+    /// are G.723.1, not the SP codec: mode 2 is the 24-byte 6.3 kbit/s frame,
+    /// modes 3 and 5 add the 4-byte SID frame. Written by older recorders such
+    /// as the DS4000, and known as DSS LP.
+    DssLp,
 }
 
 impl AudioFormat {
@@ -27,6 +32,7 @@ impl AudioFormat {
             AudioFormat::Ds2Sp => 12000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
             AudioFormat::GrundigSp => 16000,
+            AudioFormat::DssLp => 8000,
         }
     }
 
@@ -35,6 +41,7 @@ impl AudioFormat {
             AudioFormat::DssSp => "dss",
             AudioFormat::Ds2Sp | AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => "ds2",
             AudioFormat::GrundigSp => "dss",
+            AudioFormat::DssLp => "dss",
         }
     }
 }
@@ -67,6 +74,13 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     // falling through to the DS2 branch and failing there with a misleading
     // message. Six is the Grundig variant, handled just above.
     if data[1..4] == *b"dss" && data[0] > 0 && data[0] <= 32 {
+        // Byte 4 of the first block header selects the frame size. Mode 0 is the
+        // 41-byte SP frame; anything else is G.723.1, which the SP decoder must
+        // not be handed.
+        let entete = data[0] as usize * 512;
+        if data.len() > entete + 4 && data[entete + 4] != 0 {
+            return Some(AudioFormat::DssLp);
+        }
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() > 0x604 {
