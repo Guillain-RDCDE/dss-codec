@@ -83,6 +83,11 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         }
         return Some(AudioFormat::DssSp);
     }
+    // Fichier DSS ampute de son en-tete : les blocs audio sont intacts et leur
+    // chainage le prouve.
+    if crate::demux::dss::looks_like_headerless_dss(data) {
+        return Some(AudioFormat::DssSp);
+    }
     if data[..4] == *b"\x03enc" && data.len() > 0x604 {
         let format_type = data[0x600 + 4];
         return Some(match format_type {
