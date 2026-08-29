@@ -62,7 +62,11 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && data[0] == 6 {
         return Some(AudioFormat::GrundigSp);
     }
-    if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
+    // Byte 0 is the header size in 512-byte blocks. Two and three are what the
+    // common recorders write, but some write a larger header; those files were
+    // falling through to the DS2 branch and failing there with a misleading
+    // message. Six is the Grundig variant, handled just above.
+    if data[1..4] == *b"dss" && data[0] > 0 && data[0] <= 32 {
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() > 0x604 {

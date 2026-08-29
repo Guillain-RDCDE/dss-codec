@@ -17,7 +17,10 @@ struct BlockInfo {
 }
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
-    if data.len() < 4 || data[1..4] != *b"dss" || (data[0] != 2 && data[0] != 3) {
+    // Byte 0 is the header size in 512-byte blocks. Two and three are what the
+    // common recorders write, but others use a larger header, and refusing them
+    // sent the file down the DS2 path where it failed with a misleading message.
+    if data.len() < 4 || data[1..4] != *b"dss" || data[0] == 0 || data[0] > 32 {
         return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
     }
 
