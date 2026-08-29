@@ -122,6 +122,14 @@ pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> R
     // DSS SP: use the block-aware batch demuxer, which handles mid-stream
     // compact (short/padded) blocks. The streaming demuxer concatenates full
     // block payloads and mis-reads compact-block padding as audio.
+    // Les fichiers DSS LP portent des trames G.723.1, que ce decodeur
+    // n'implemente pas : le dire, plutot que rendre un flux vide.
+    if detect_format(data) == Some(AudioFormat::DssLp) {
+        let entete = data[0] as usize * 512;
+        let mode = data.get(entete + 4).copied().unwrap_or(0);
+        return Err(DecodeError::DssLp(mode));
+    }
+
     if detect_format(data) == Some(AudioFormat::DssSp) {
         let (packets, _total) = crate::demux::dss::demux_dss(data)?;
         let mut decoder = crate::codec::dss_sp::DssSpDecoder::new();
