@@ -2,7 +2,7 @@
 //!
 //! Architecture: CELP with 14 reflection coefficients, Levinson recursion,
 //! pitch-adaptive excitation, 7-pulse fixed codebook, cascaded LPC synthesis +
-//! error correction, noise modulation, and 11:12 sinc resampling (12000→11025 Hz).
+//! error correction, noise modulation, and 11:12 sinc resampling (12000→11000 Hz).
 
 use crate::bitstream::BitstreamReader;
 use crate::tables::dss_sp::*;
