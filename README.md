@@ -1,3 +1,12 @@
+
+<!-- opening -->
+> The engine that reads the closed dictation format behind DS2-Anywhere.
+>
+> A Rust decoder reverse-engineered from the vendor’s library, output matched to the original down to the last sample, Grundig DSS-SP added, broken headers recovered.
+>
+> Reverse engineering that ends in production, not in a write-up. Part of the work of [Guillain d’Erceville](https://github.com/Guillain-RDCDE), forward deployed engineer.
+<!-- opening -->
+
 > **This is a fork.** Upstream decoder by [hirparak](https://github.com/hirparak/dss-codec), with C work by Patrick Domack and Rust work by [Gaspard Petit](https://github.com/gaspardpetit/dss-codec).
 >
 > **What is mine here (12 commits):** Grundig DSS-SP (PH9607) decode support; replacing the synthesis with the DLL-matched lattice pipeline; correcting the DSS SP output rate to 11000 Hz (not 11025); block-by-block frame walking with per-block byte-swap parity; tolerance for any header size, and recovery of files whose header was lost. This work feeds [DS2-Anywhere](https://github.com/Guillain-RDCDE/DS2-Anywhere) and the FFmpeg patch series.
