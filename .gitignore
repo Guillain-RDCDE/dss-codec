@@ -16,4 +16,7 @@ test_files/
 *.swo
 
 # Claude Code
-.claude/
+!.claude/
+.claude/*
+!.claude/settings.json
+!.claude/CLAUDE.md
