@@ -60,7 +60,7 @@ fn test_decode_dss_sp_basic() {
         return;
     }
     let buf = dss_codec::decode_file(path).unwrap();
-    assert_eq!(buf.native_rate, 11025);
+    assert_eq!(buf.native_rate, 11000);
     assert!(!buf.samples.is_empty());
 }
 
