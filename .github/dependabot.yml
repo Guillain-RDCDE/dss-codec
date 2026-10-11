@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Actions only: the crate's dependencies follow upstream (hirparak/dss-codec),
+  # so this fork does not bump them on its own.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

@@ -5,12 +5,27 @@ on:
   # This fork carries its own commits on main: test them where they land.
   push:
     branches: [main]
+  # Run by hand on any branch or commit, e.g. a branch prepared for upstream
+  # whose own workflow only triggers on pull requests.
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or SHA to test (default the dispatching ref)
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-and-test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -26,6 +41,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
