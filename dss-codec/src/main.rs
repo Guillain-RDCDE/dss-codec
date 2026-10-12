@@ -214,9 +214,15 @@ mod tests {
     use super::{make_decrypt_output_path, resolve_password};
     use std::env;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Tests run in parallel threads and share the process environment: the two
+    // tests below set and remove the same variable, so they take turns.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn resolve_password_prefers_cli_over_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             env::set_var("DSS_CODEC_PASSWORD", "env-secret");
         }
@@ -228,6 +234,7 @@ mod tests {
 
     #[test]
     fn resolve_password_falls_back_to_env() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             env::set_var("DSS_CODEC_PASSWORD", "env-secret");
         }
