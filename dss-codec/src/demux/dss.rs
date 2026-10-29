@@ -1,306 +1,285 @@
-/// DSS block-aware demuxer with byte-swap frame extraction.
+/// DSS SP demuxer.
 ///
-/// Handles empty blocks (frame_count=0) by only including continuation bytes
-/// from empty block payloads, and resetting swap state at block group boundaries.
+/// Walks the file block by block. Each block header gives the offset of its
+/// first frame, the byte-swap parity of that frame and the number of frames
+/// that start in the block. Frames are read through the block headers they
+/// straddle. A frame that the file does not hold in full ends the stream.
 use crate::error::{DecodeError, Result};
-use std::collections::VecDeque;
 
 const DSS_BLOCK_SIZE: usize = 512;
 const DSS_BLOCK_HEADER_SIZE: usize = 6;
 const DSS_SP_FRAME_SIZE: usize = 42;
-
-struct BlockInfo {
-    frame_count: usize,
-    swap: usize,
-    cont_size: usize,
-    payload: Vec<u8>,
-}
+const DSS_SP_PACKET_BUF: usize = 48;
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     if data.len() < 4 || data[1..4] != *b"dss" || (data[0] != 2 && data[0] != 3) {
         return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
     }
 
-    let version = data[0] as usize;
-    let header_size = version * DSS_BLOCK_SIZE;
-    let num_blocks = (data.len() - header_size) / DSS_BLOCK_SIZE;
-
-    let mut blocks = Vec::with_capacity(num_blocks);
-    let mut total_frames: usize = 0;
-
-    for bi in 0..num_blocks {
-        let bstart = header_size + bi * DSS_BLOCK_SIZE;
-        let byte0 = data[bstart];
-        let byte1 = data[bstart + 1] as usize;
-        let frame_count = data[bstart + 2] as usize;
-        let blk_swap = ((byte0 >> 7) & 1) as usize;
-        let cont_size = (2 * byte1 + 2 * blk_swap).saturating_sub(DSS_BLOCK_HEADER_SIZE);
-        let payload_end = bstart + DSS_BLOCK_SIZE;
-        let payload = data[bstart + DSS_BLOCK_HEADER_SIZE..payload_end].to_vec();
-        blocks.push(BlockInfo {
-            frame_count,
-            swap: blk_swap,
-            cont_size,
-            payload,
-        });
-        total_frames += frame_count;
+    let header_size = data[0] as usize * DSS_BLOCK_SIZE;
+    if data.len() < header_size {
+        return Err(DecodeError::Truncated("DSS header".to_string()));
     }
+    let (frames, _cut) = dss_sp_frames(data, header_size);
+    let total_frames = frames.len();
+    Ok((frames, total_frames))
+}
 
-    // Le conteneur se decrit lui-meme : chaque bloc donne l'offset de sa
-    // premiere trame et la parite d'echange qui va avec. Plutot que de derouler
-    // une marche continue qui peut se desynchroniser sans jamais s'en rendre
-    // compte, on repart de ce que chaque bloc declare. Une trame qui deborde
-    // sur le bloc suivant se lit sans rien de special, puisque les charges
-    // utiles sont concatenees ; et si le debordement ne correspond pas a ce que
-    // le bloc suivant annonce, la remise en place est automatique.
-    let mut stream: Vec<u8> = Vec::new();
-    let mut debuts: Vec<usize> = Vec::with_capacity(blocks.len());
-    for b in blocks.iter() {
-        debuts.push(stream.len());
-        stream.extend_from_slice(&b.payload);
-    }
-
-    let mut frame_packets = Vec::with_capacity(total_frames);
-    let mut swap_byte: u8 = 0;
-
-    for (bi, b) in blocks.iter().enumerate() {
-        if b.frame_count == 0 {
-            continue;
+pub(crate) fn dss_sp_frames(data: &[u8], header_size: usize) -> (Vec<Vec<u8>>, bool) {
+    let mut walker = DssSpWalker::new(header_size);
+    let src = DssBytes {
+        data,
+        base: 0,
+        eof: true,
+    };
+    let mut frames = Vec::new();
+    loop {
+        match walker.step(&src) {
+            DssStep::Frame(frame) => frames.push(frame),
+            DssStep::Dropped => {}
+            DssStep::End { cut } => return (frames, cut),
+            DssStep::NeedMore => return (frames, false),
         }
-        let mut spos = debuts[bi] + b.cont_size.min(b.payload.len());
-        let mut swap = b.swap;
+    }
+}
 
-        for _ in 0..b.frame_count {
-            let mut pkt = [0u8; DSS_SP_FRAME_SIZE + 1];
-            if swap != 0 {
-                let read_size = 40;
-                let end = (spos + read_size).min(stream.len());
-                let start = spos.min(end);
-                let count = end - start;
-                pkt[3..3 + count].copy_from_slice(&stream[start..end]);
-                spos += read_size;
-                for i in (0..DSS_SP_FRAME_SIZE - 2).step_by(2) {
-                    pkt[i] = pkt[i + 4];
-                }
-                pkt[DSS_SP_FRAME_SIZE] = 0;
-                pkt[1] = swap_byte;
-            } else {
-                let end = (spos + DSS_SP_FRAME_SIZE).min(stream.len());
-                let start = spos.min(end);
-                let count = end - start;
-                pkt[..count].copy_from_slice(&stream[start..end]);
-                spos += DSS_SP_FRAME_SIZE;
-                swap_byte = pkt[DSS_SP_FRAME_SIZE - 2];
+struct DssBytes<'a> {
+    data: &'a [u8],
+    base: usize,
+    eof: bool,
+}
+
+enum Short {
+    NeedMore,
+    End,
+}
+
+impl DssBytes<'_> {
+    fn get(&self, pos: usize, len: usize) -> std::result::Result<&[u8], Short> {
+        let start = pos.checked_sub(self.base).ok_or(Short::End)?;
+        if start + len <= self.data.len() {
+            Ok(&self.data[start..start + len])
+        } else if self.eof {
+            Err(Short::End)
+        } else {
+            Err(Short::NeedMore)
+        }
+    }
+
+    fn byte_or_zero(&self, pos: usize) -> std::result::Result<u8, Short> {
+        match self.get(pos, 1) {
+            Ok(bytes) => Ok(bytes[0]),
+            Err(Short::End) => Ok(0),
+            Err(Short::NeedMore) => Err(Short::NeedMore),
+        }
+    }
+}
+
+enum DssStep {
+    Frame(Vec<u8>),
+    Dropped,
+    NeedMore,
+    End { cut: bool },
+}
+
+#[derive(Clone, Copy)]
+struct DssSpWalker {
+    header_size: usize,
+    block_pos: usize,
+    pos: usize,
+    frames_left: usize,
+    swap: bool,
+    swap_byte: Option<u8>,
+}
+
+impl DssSpWalker {
+    fn new(header_size: usize) -> Self {
+        Self {
+            header_size,
+            block_pos: header_size - DSS_BLOCK_SIZE,
+            pos: header_size,
+            frames_left: 0,
+            swap: false,
+            swap_byte: None,
+        }
+    }
+
+    fn step(&mut self, src: &DssBytes) -> DssStep {
+        let saved = *self;
+        match self.read_frame(src) {
+            Ok(step) => step,
+            Err(_) => {
+                *self = saved;
+                DssStep::NeedMore
             }
-            pkt[DSS_SP_FRAME_SIZE - 2] = 0;
-            swap ^= 1;
-            frame_packets.push(pkt[..DSS_SP_FRAME_SIZE].to_vec());
         }
     }
 
-    Ok((frame_packets, total_frames))
+    fn read_frame(&mut self, src: &DssBytes) -> std::result::Result<DssStep, Short> {
+        if self.frames_left == 0 {
+            match self.next_block(src) {
+                Err(Short::End) => return Ok(DssStep::End { cut: false }),
+                other => other?,
+            }
+        }
+
+        let size = DSS_SP_FRAME_SIZE - 1;
+        let mut pkt = [0u8; DSS_SP_PACKET_BUF];
+        let read = if self.swap {
+            self.read_payload(src, &mut pkt[3..3 + size - 1])
+        } else {
+            self.read_payload(src, &mut pkt[..size + 1])
+        };
+        match read {
+            Err(Short::End) => return Ok(DssStep::End { cut: true }),
+            other => other?,
+        }
+        self.frames_left -= 1;
+
+        self.byte_swap(&mut pkt, size);
+        if self.swap_byte.is_none() {
+            return Ok(DssStep::Dropped);
+        }
+        Ok(DssStep::Frame(pkt[..DSS_SP_FRAME_SIZE].to_vec()))
+    }
+
+    fn next_block(&mut self, src: &DssBytes) -> std::result::Result<(), Short> {
+        loop {
+            self.block_pos += DSS_BLOCK_SIZE;
+            let header = src.get(self.block_pos, DSS_BLOCK_HEADER_SIZE)?;
+
+            self.swap = header[0] & 0x80 != 0;
+            let mut cont =
+                2 * header[1] as isize + 2 * self.swap as isize - DSS_BLOCK_HEADER_SIZE as isize;
+            if cont < 0 || cont > (DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE) as isize {
+                cont = 0;
+            }
+            let cont = cont as usize;
+
+            self.frames_left = header[2] as usize;
+            if self.frames_left == 0 {
+                continue;
+            }
+
+            if self.swap {
+                let mut at = self.block_pos + cont - 2;
+                if cont >= 2 {
+                    at += DSS_BLOCK_HEADER_SIZE;
+                }
+                if at >= self.header_size + DSS_BLOCK_HEADER_SIZE {
+                    self.swap_byte = Some(src.byte_or_zero(at)?);
+                }
+            }
+
+            self.pos = self.block_pos + DSS_BLOCK_HEADER_SIZE + cont;
+            return Ok(());
+        }
+    }
+
+    fn read_payload(&mut self, src: &DssBytes, buf: &mut [u8]) -> std::result::Result<(), Short> {
+        let mut done = 0;
+        while done < buf.len() {
+            let off = (self.pos - self.header_size) % DSS_BLOCK_SIZE;
+            if off < DSS_BLOCK_HEADER_SIZE {
+                self.pos += DSS_BLOCK_HEADER_SIZE - off;
+                continue;
+            }
+            let chunk = (buf.len() - done).min(DSS_BLOCK_SIZE - off);
+            let bytes = src.get(self.pos, chunk)?;
+            buf[done..done + chunk].copy_from_slice(bytes);
+            self.pos += chunk;
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    fn byte_swap(&mut self, pkt: &mut [u8; DSS_SP_PACKET_BUF], size: usize) {
+        if self.swap {
+            for i in (0..size - 1).step_by(2) {
+                pkt[i] = pkt[i + 4];
+            }
+            pkt[1] = self.swap_byte.unwrap_or(0xff);
+        } else {
+            self.swap_byte = Some(pkt[size - 1]);
+        }
+        pkt[size + 1..DSS_SP_FRAME_SIZE + 1].fill(0);
+        pkt[size - 1] = 0;
+        self.swap = !self.swap;
+    }
 }
 
 pub(crate) struct DssSpStreamDemuxer {
-    header_size: usize,
-    header_complete: bool,
-    block_buf: Vec<u8>,
-    stream_buf: Vec<u8>,
-    stream_pos: usize,
-    swap: usize,
-    swap_byte: u8,
-    /// Blocs recus dont les trames restent a emettre : (debut de la premiere
-    /// trame dans le flux, nombre de trames, parite d'echange declaree).
-    en_attente: VecDeque<(usize, usize, usize)>,
-    stream_end_pos: usize,
+    walker: DssSpWalker,
+    buf: Vec<u8>,
+    base: usize,
 }
 
 impl DssSpStreamDemuxer {
     pub(crate) fn new(version: u8) -> Self {
+        Self::with_header_size(version as usize * DSS_BLOCK_SIZE)
+    }
+
+    pub(crate) fn with_header_size(header_size: usize) -> Self {
         Self {
-            header_size: version as usize * DSS_BLOCK_SIZE,
-            header_complete: false,
-            block_buf: Vec::new(),
-            stream_buf: Vec::new(),
-            stream_pos: 0,
-            swap: 0,
-            swap_byte: 0,
-            en_attente: VecDeque::new(),
-            stream_end_pos: 0,
+            walker: DssSpWalker::new(header_size),
+            buf: Vec::new(),
+            base: 0,
         }
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut frames = Vec::new();
-        let mut offset = 0;
-
-        if !self.header_complete {
-            let needed = self.header_size.saturating_sub(self.block_buf.len());
-            let take = needed.min(data.len());
-            self.block_buf.extend_from_slice(&data[..take]);
-            offset += take;
-            if self.block_buf.len() < self.header_size {
-                return Ok(frames);
-            }
-            self.header_complete = true;
-            self.block_buf.clear();
-        }
-
-        self.block_buf.extend_from_slice(&data[offset..]);
-        while self.block_buf.len() >= DSS_BLOCK_SIZE {
-            let block: Vec<u8> = self.block_buf.drain(..DSS_BLOCK_SIZE).collect();
-            self.process_block(&block, &mut frames);
-        }
-
-        Ok(frames)
+        self.buf.extend_from_slice(data);
+        Ok(self.walk(false).0)
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<Vec<u8>>> {
-        if !self.header_complete {
-            if self.block_buf.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(DecodeError::Truncated("DSS header".to_string()));
-        }
-        if !self.block_buf.is_empty() {
-            return Err(DecodeError::Truncated("DSS block".to_string()));
-        }
-        if !self.en_attente.is_empty() {
+        self.check_header()?;
+        let (frames, cut) = self.walk(true);
+        let tail = (self.base + self.buf.len()).saturating_sub(self.walker.header_size);
+        if cut && !tail.is_multiple_of(DSS_BLOCK_SIZE) {
             return Err(DecodeError::Truncated("DSS SP frame".to_string()));
         }
-        Ok(Vec::new())
-    }
-
-    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<Vec<u8>>> {
-        if !self.header_complete {
-            if self.block_buf.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(DecodeError::Truncated("DSS header".to_string()));
-        }
-
-        self.block_buf.clear();
-
-        // Fin de flux : on emet ce qui reste, en tolerant une derniere trame
-        // tronquee.
-        let mut frames = Vec::new();
-        while let Some((debut, fc, sw)) = self.en_attente.pop_front() {
-            self.stream_pos = debut.min(self.stream_buf.len() + self.stream_pos);
-            self.swap = sw;
-            for _ in 0..fc {
-                let taille = if self.swap != 0 { 40 } else { DSS_SP_FRAME_SIZE };
-                frames.push(self.extract_packet_padded(taille));
-            }
-            self.compact_stream();
-        }
-
         Ok(frames)
     }
 
-    fn process_block(&mut self, block: &[u8], frames: &mut Vec<Vec<u8>>) {
-        let byte0 = block[0];
-        let byte1 = block[1] as usize;
-        let frame_count = block[2] as usize;
-        let blk_swap = ((byte0 >> 7) & 1) as usize;
-        let cont_size = (2 * byte1 + 2 * blk_swap).saturating_sub(DSS_BLOCK_HEADER_SIZE);
-        let payload = &block[DSS_BLOCK_HEADER_SIZE..];
-
-        // Comme en mode par lot : le bloc dit lui-meme ou commence sa premiere
-        // trame et avec quelle parite. On note cela et on emettra ses trames
-        // des que les octets seront la -- la derniere peut deborder sur le
-        // bloc suivant.
-        let debut = self.stream_end_pos;
-        self.stream_buf.extend_from_slice(payload);
-        self.stream_end_pos += payload.len();
-        if frame_count > 0 {
-            self.en_attente.push_back((
-                debut + cont_size.min(payload.len()),
-                frame_count,
-                blk_swap,
-            ));
-        }
-
-        self.emit_available_frames(frames);
+    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<Vec<u8>>> {
+        self.check_header()?;
+        Ok(self.walk(true).0)
     }
 
-    fn emit_available_frames(&mut self, frames: &mut Vec<Vec<u8>>) {
-        while let Some(&(debut, fc, sw)) = self.en_attente.front() {
-            // De combien d'octets ce bloc a-t-il besoin en tout ?
-            let mut besoin = 0usize;
-            let mut p = sw;
-            for _ in 0..fc {
-                besoin += if p != 0 { 40 } else { DSS_SP_FRAME_SIZE };
-                p ^= 1;
+    fn check_header(&self) -> Result<()> {
+        let received = self.base + self.buf.len();
+        if received > 0 && received < self.walker.header_size {
+            return Err(DecodeError::Truncated("DSS header".to_string()));
+        }
+        Ok(())
+    }
+
+    fn walk(&mut self, eof: bool) -> (Vec<Vec<u8>>, bool) {
+        let mut frames = Vec::new();
+        let cut = loop {
+            let src = DssBytes {
+                data: &self.buf,
+                base: self.base,
+                eof,
+            };
+            match self.walker.step(&src) {
+                DssStep::Frame(frame) => frames.push(frame),
+                DssStep::Dropped => {}
+                DssStep::NeedMore => break false,
+                DssStep::End { cut } => break cut,
             }
-            if debut + besoin > self.stream_end_pos {
-                break;
-            }
-            self.stream_pos = debut;
-            self.swap = sw;
-            for _ in 0..fc {
-                let taille = if self.swap != 0 { 40 } else { DSS_SP_FRAME_SIZE };
-                frames.push(self.extract_packet(taille));
-            }
-            self.en_attente.pop_front();
-            self.compact_stream();
-        }
-    }
+        };
 
-    fn extract_packet(&mut self, read_size: usize) -> Vec<u8> {
-        let mut pkt = [0u8; DSS_SP_FRAME_SIZE + 1];
-        let end = self.stream_pos + read_size;
-        let chunk = self.stream_buf[self.stream_pos..end].to_vec();
-        self.fill_packet(&mut pkt, chunk);
-        self.stream_pos = end;
-        pkt[..DSS_SP_FRAME_SIZE].to_vec()
-    }
+        let unneeded = self
+            .walker
+            .block_pos
+            .saturating_sub(self.base)
+            .min(self.buf.len());
+        self.buf.drain(..unneeded);
+        self.base += unneeded;
 
-    fn extract_packet_padded(&mut self, read_size: usize) -> Vec<u8> {
-        let take = read_size.min(self.available_stream());
-        let end = self.stream_pos + take;
-        let chunk = self.stream_buf[self.stream_pos..end].to_vec();
-        let mut pkt = [0u8; DSS_SP_FRAME_SIZE + 1];
-        self.fill_packet(&mut pkt, chunk);
-        self.stream_pos = end;
-        pkt[..DSS_SP_FRAME_SIZE].to_vec()
-    }
-
-    fn fill_packet(&mut self, pkt: &mut [u8; DSS_SP_FRAME_SIZE + 1], chunk: Vec<u8>) {
-        if self.swap != 0 {
-            pkt[3..3 + chunk.len()].copy_from_slice(&chunk);
-            for i in (0..DSS_SP_FRAME_SIZE - 2).step_by(2) {
-                pkt[i] = pkt[i + 4];
-            }
-            pkt[DSS_SP_FRAME_SIZE] = 0;
-            pkt[1] = self.swap_byte;
-        } else {
-            pkt[..chunk.len()].copy_from_slice(&chunk);
-            self.swap_byte = pkt[DSS_SP_FRAME_SIZE - 2];
-        }
-        pkt[DSS_SP_FRAME_SIZE - 2] = 0;
-        self.swap ^= 1;
-    }
-
-    fn available_stream(&self) -> usize {
-        self.stream_buf.len().saturating_sub(self.stream_pos)
-    }
-
-    fn compact_stream(&mut self) {
-        if self.stream_pos == 0 {
-            return;
-        }
-        if self.stream_pos >= self.stream_buf.len() {
-            self.stream_buf.clear();
-            self.stream_pos = 0;
-            return;
-        }
-        self.stream_buf.drain(..self.stream_pos);
-        let consumed = self.stream_pos;
-        self.stream_pos = 0;
-        for (debut, _, _) in &mut self.en_attente {
-            *debut = debut.saturating_sub(consumed);
-        }
-        self.stream_end_pos = self.stream_end_pos.saturating_sub(consumed);
+        (frames, cut)
     }
 }
 
@@ -324,6 +303,16 @@ mod tests {
         block
     }
 
+    fn make_dss_file(blocks: &[[u8; DSS_BLOCK_SIZE]]) -> Vec<u8> {
+        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
+        data[0] = 2;
+        data[1..4].copy_from_slice(b"dss");
+        for block in blocks {
+            data.extend_from_slice(block);
+        }
+        data
+    }
+
     fn collect_frames(
         demuxer: &mut DssSpStreamDemuxer,
         data: &[u8],
@@ -339,10 +328,7 @@ mod tests {
 
     #[test]
     fn test_dss_stream_demux_matches_batch() {
-        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
-        data[0] = 2;
-        data[1..4].copy_from_slice(b"dss");
-        data.extend_from_slice(&make_dss_block(0, 0, 3, 0x20));
+        let data = make_dss_file(&[make_dss_block(0, 0, 3, 0x20)]);
 
         let (expected, _) = demux_dss(&data).unwrap();
         let mut demuxer = DssSpStreamDemuxer::new(2);
@@ -353,12 +339,11 @@ mod tests {
 
     #[test]
     fn test_dss_stream_demux_empty_block_reset_matches_batch() {
-        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
-        data[0] = 2;
-        data[1..4].copy_from_slice(b"dss");
-        data.extend_from_slice(&make_dss_block(0, 0, 13, 0x10));
-        data.extend_from_slice(&make_dss_block(1, 17, 0, 0x80));
-        data.extend_from_slice(&make_dss_block(1, 0, 1, 0xC0));
+        let data = make_dss_file(&[
+            make_dss_block(0, 0, 13, 0x10),
+            make_dss_block(1, 17, 0, 0x80),
+            make_dss_block(1, 0, 1, 0xC0),
+        ]);
 
         let (expected, _) = demux_dss(&data).unwrap();
         let mut demuxer = DssSpStreamDemuxer::new(2);
@@ -368,34 +353,218 @@ mod tests {
     }
 
     #[test]
-    fn test_dss_demux_overdeclared_frames_no_panic() {
-        // A block that declares more frames than its payload holds makes the
-        // frame walk run past the end of the assembled stream; the trailing
-        // packets must come back zero-padded instead of panicking.
-        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
-        data[0] = 2;
-        data[1..4].copy_from_slice(b"dss");
-        data.extend_from_slice(&make_dss_block(0, 3, 14, 0x20));
+    fn test_dss_demux_frame_across_block_header() {
+        let data = make_dss_file(&[
+            make_dss_block(0, 3, 13, 0x10),
+            make_dss_block(1, 16, 1, 0x80),
+        ]);
 
         let (frames, total) = demux_dss(&data).unwrap();
         assert_eq!(total, 14);
         assert_eq!(frames.len(), 14);
+        let last_whole = &frames[12];
+        assert_eq!(last_whole[0], data[2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 492]);
+        assert_eq!(last_whole[13], data[2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 505]);
+        assert_eq!(last_whole[14], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE]);
+        assert_eq!(frames[13][1], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 26]);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, &data, 61), frames);
+    }
+
+    #[test]
+    fn test_dss_demux_reads_swap_byte_from_file() {
+        let data = make_dss_file(&[
+            make_dss_block(0, 3, 1, 0x10),
+            make_dss_block(1, 20, 1, 0x80),
+        ]);
+
+        let (frames, _) = demux_dss(&data).unwrap();
+        assert_eq!(frames.len(), 2);
+        let carried = data[2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 40];
+        let in_file = data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 34];
+        assert_ne!(carried, in_file);
+        assert_eq!(frames[1][1], in_file);
+        assert_eq!(frames[1][40], 0);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, &data, 7), frames);
+    }
+
+    #[test]
+    fn test_dss_demux_drops_swapped_frame_without_swap_byte() {
+        let data = make_dss_file(&[make_dss_block(1, 2, 3, 0x40)]);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(frames.len(), 2);
+        let payload = &data[2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE..];
+        assert_eq!(frames[0][..40], payload[40..80]);
+        assert_eq!(frames[1][1], payload[80]);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, &data, 33), frames);
+    }
+
+    #[test]
+    fn test_dss_demux_partial_last_block() {
+        let whole = make_dss_file(&[make_dss_block(0, 3, 3, 0x20)]);
+        let end = 2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 124;
+
+        let (frames, _) = demux_dss(&whole[..end]).unwrap();
+        let (expected, _) = demux_dss(&whole).unwrap();
+        assert_eq!(frames, expected);
+        assert_eq!(frames.len(), 3);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, &whole[..end], 50), frames);
+    }
+
+    #[test]
+    fn test_dss_demux_cut_block_header_ends_cleanly() {
+        let mut data = make_dss_file(&[make_dss_block(0, 3, 3, 0x20)]);
+        data.extend_from_slice(&[0x00, 0x03, 0x05]);
+
+        let (frames, _) = demux_dss(&data).unwrap();
+        assert_eq!(frames.len(), 3);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, &data, 100).len(), 3);
+    }
+
+    #[test]
+    fn test_dss_demux_cut_frame_is_dropped() {
+        let whole = make_dss_file(&[make_dss_block(0, 3, 3, 0x20)]);
+        let end = 2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 123;
+
+        let (frames, total) = demux_dss(&whole[..end]).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(frames.len(), 2);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let _ = demuxer.push(&whole[..end]).unwrap();
+        let err = demuxer.finish().unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated(_)));
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut lenient = demuxer.push(&whole[..end]).unwrap();
+        lenient.extend(demuxer.finish_lenient().unwrap());
+        assert_eq!(lenient, frames);
+    }
+
+    #[test]
+    fn test_dss_demux_overdeclared_frames_stop_at_end_of_file() {
+        let data = make_dss_file(&[make_dss_block(0, 3, 14, 0x20)]);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 12);
+        assert_eq!(frames.len(), 12);
         assert!(frames.iter().all(|f| f.len() == DSS_SP_FRAME_SIZE));
     }
 
     #[test]
     fn test_dss_stream_demux_truncated_frame() {
-        let mut data = vec![0u8; 2 * DSS_BLOCK_SIZE];
-        data[0] = 2;
-        data[1..4].copy_from_slice(b"dss");
-        data.extend_from_slice(&make_dss_block(0, 0, 20, 0x30));
+        let data = make_dss_file(&[make_dss_block(0, 0, 20, 0x30)]);
 
         let mut demuxer = DssSpStreamDemuxer::new(2);
-        for chunk in data.chunks(211) {
+        for chunk in data[..data.len() - 100].chunks(211) {
             let _ = demuxer.push(chunk).unwrap();
         }
 
         let err = demuxer.finish().unwrap_err();
         assert!(matches!(err, DecodeError::Truncated(_)));
+    }
+
+    #[test]
+    fn test_dss_stream_demux_frame_past_block_boundary_is_complete() {
+        let whole = make_dss_file(&[
+            make_dss_block(0, 3, 13, 0x10),
+            make_dss_block(1, 16, 1, 0x80),
+        ]);
+        let data = &whole[..3 * DSS_BLOCK_SIZE];
+
+        let (frames, _) = demux_dss(data).unwrap();
+        assert_eq!(frames.len(), 12);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        assert_eq!(collect_frames(&mut demuxer, data, 70), frames);
+    }
+
+    #[test]
+    fn test_dss_stream_demux_frame_into_cut_block_header_fails() {
+        let whole = make_dss_file(&[
+            make_dss_block(0, 3, 13, 0x10),
+            make_dss_block(1, 16, 1, 0x80),
+        ]);
+        for cut in [1, 5, DSS_BLOCK_HEADER_SIZE] {
+            let data = &whole[..3 * DSS_BLOCK_SIZE + cut];
+            let (frames, _) = demux_dss(data).unwrap();
+            assert_eq!(frames.len(), 12);
+
+            let mut demuxer = DssSpStreamDemuxer::new(2);
+            let _ = demuxer.push(data).unwrap();
+            assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
+
+            let mut demuxer = DssSpStreamDemuxer::new(2);
+            let mut lenient = demuxer.push(data).unwrap();
+            lenient.extend(demuxer.finish_lenient().unwrap());
+            assert_eq!(lenient, frames);
+        }
+    }
+
+    #[test]
+    fn test_dss_stream_demux_cut_before_stated_frame_fails() {
+        let whole = make_dss_file(&[make_dss_block(0, 3, 5, 0x20)]);
+        let end = 2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 124;
+        let (frames, _) = demux_dss(&whole[..end]).unwrap();
+        assert_eq!(frames.len(), 3);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let _ = demuxer.push(&whole[..end]).unwrap();
+        assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut lenient = demuxer.push(&whole[..end]).unwrap();
+        lenient.extend(demuxer.finish_lenient().unwrap());
+        assert_eq!(lenient, frames);
+    }
+
+    #[test]
+    fn test_dss_stream_demux_truncated_header() {
+        let data = make_dss_file(&[]);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let _ = demuxer.push(&data[..100]).unwrap();
+        assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
+
+        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let _ = demuxer.push(&data[..100]).unwrap();
+        assert!(matches!(demuxer.finish_lenient(), Err(DecodeError::Truncated(_))));
+    }
+
+    #[test]
+    fn test_dss_demux_truncated_header() {
+        let data = make_dss_file(&[]);
+        for cut in [4, 100, data.len() - 1] {
+            assert!(matches!(
+                demux_dss(&data[..cut]),
+                Err(DecodeError::Truncated(what)) if what == "DSS header"
+            ));
+            assert!(matches!(
+                crate::decode_to_buffer(&data[..cut]),
+                Err(DecodeError::Truncated(what)) if what == "DSS header"
+            ));
+        }
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_dss_demux_rejects_other_magic() {
+        let mut data = make_dss_file(&[make_dss_block(0, 3, 1, 0x20)]);
+        data[0] = 6;
+        assert!(matches!(demux_dss(&data), Err(DecodeError::NotDss(_))));
+        assert!(matches!(demux_dss(b"\x02ds"), Err(DecodeError::NotDss(_))));
     }
 }
