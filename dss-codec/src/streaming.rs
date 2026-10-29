@@ -369,6 +369,13 @@ impl DecryptStreamer {
         }
     }
 
+    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<u8>> {
+        match &mut self.mode {
+            DecryptMode::Encrypted(decryptor) => decryptor.finish_lenient(),
+            _ => self.finish(),
+        }
+    }
+
     pub fn finish(&mut self) -> Result<Vec<u8>> {
         match &mut self.mode {
             DecryptMode::PassThrough => Ok(std::mem::take(&mut self.prebuffer)),
@@ -437,7 +444,7 @@ impl DecryptingDecoderStreamer {
             return Ok(Vec::new());
         }
 
-        let plain = self.decryptor.finish()?;
+        let plain = self.decryptor.finish_lenient()?;
         let mut samples = self.inner.push(&plain)?;
         samples.extend(self.inner.finish_lenient()?);
         self.finished = true;
