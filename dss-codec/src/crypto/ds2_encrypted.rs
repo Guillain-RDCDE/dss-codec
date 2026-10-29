@@ -812,7 +812,7 @@ mod tests {
             .chunks_mut(DS2_BLOCK_SIZE)
             .enumerate()
         {
-            block[..DS2_BLOCK_HEADER_SIZE].copy_from_slice(&[0, 3, 9, 0, 6, 0xff]);
+            block[..DS2_BLOCK_HEADER_SIZE].copy_from_slice(&[0, 3, 9, 0xff, 6, 0xff]);
             for (j, byte) in block[DS2_BLOCK_HEADER_SIZE..].iter_mut().enumerate() {
                 *byte = (j as u8).wrapping_mul(29).wrapping_add(i as u8);
             }

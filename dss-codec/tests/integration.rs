@@ -167,3 +167,61 @@ fn test_decode_grundig_sp_bit_exact() {
     let _ = std::fs::remove_file(&in_path);
     let _ = std::fs::remove_file(&out_path);
 }
+
+#[test]
+fn test_decode_and_write_resamples_each_part() {
+    let mut data = vec![0u8; 0x600];
+    data[..4].copy_from_slice(b"\x03ds2");
+    for format in [0u8, 6] {
+        let mut block = vec![0u8; 512];
+        block[1] = 3;
+        block[2] = 3;
+        block[3] = 0xff;
+        block[4] = format;
+        for (i, byte) in block[6..].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        data.extend_from_slice(&block);
+    }
+
+    let dir = std::env::temp_dir();
+    let in_path = dir.join("dss_codec_parts_in.ds2");
+    let out_path = dir.join("dss_codec_parts_out.wav");
+    std::fs::write(&in_path, &data).unwrap();
+
+    let decoded = dss_codec::decode_file(&in_path).unwrap();
+    assert_eq!(decoded.native_rate, 12000);
+    assert_eq!(decoded.samples.len(), 3 * 288 + 3 * 256);
+
+    for (rate, lens) in [
+        (None, [3 * 288, 3 * 192]),
+        (Some(12000), [3 * 288, 3 * 192]),
+        (Some(16000), [3 * 384, 3 * 256]),
+    ] {
+        let config = dss_codec::output::OutputConfig {
+            sample_rate: rate,
+            ..Default::default()
+        };
+        let buf = dss_codec::decode_and_write(&in_path, &out_path, &config).unwrap();
+        let rate = rate.unwrap_or(12000);
+        let parts: Vec<_> = buf
+            .parts
+            .iter()
+            .map(|part| (part.start, part.len, part.rate, part.block_format))
+            .collect();
+        assert_eq!(parts, [(0, lens[0], rate, 0), (lens[0], lens[1], rate, 6)]);
+        assert_eq!(buf.samples.len(), lens[0] + lens[1]);
+
+        let produced = std::fs::read(&out_path).unwrap();
+        assert_eq!(u32::from_le_bytes(produced[24..28].try_into().unwrap()), rate);
+        assert_eq!(wav_samples(&produced).len(), lens[0] + lens[1]);
+        if rate == 12000 {
+            assert_eq!(buf.samples[..lens[0]], decoded.samples[..lens[0]]);
+        } else {
+            assert_eq!(buf.samples[lens[0]..], decoded.samples[3 * 288..]);
+        }
+    }
+
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out_path);
+}

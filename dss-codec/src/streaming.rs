@@ -2,15 +2,17 @@ use crate::codec::ds2_qp::Ds2QpDecoder;
 use crate::codec::grundig_sp::GrundigSpDecoder;
 use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
 use crate::demux::ds2::{
-    demux_ds2, find_ds2_format_type, qp_frame_in_progress, DemuxedDs2, Ds2QpStreamDemuxer,
+    demux_ds2, ds2_layout, known_ds2_format_type, mixed_qp_frames, qp_frame_in_progress,
+    DemuxedDs2, Ds2Layout, Ds2Qp7Segment, Ds2QpStreamDemuxer,
 };
-use crate::demux::dss::DssSpStreamDemuxer;
+use crate::demux::dss::{DssSpStreamDemuxer, TaggedFrames};
 use crate::demux::grundig::GrundigSpStreamDemuxer;
 use crate::demux::{
     audio_start, check_sp_codec, detect_format, ds2_header_size, dss_header_size, sp_codec,
     AudioFormat,
 };
 use crate::error::{DecodeError, Result};
+use crate::AudioPart;
 
 pub struct StreamingDecoder {
     prebuffer: Vec<u8>,
@@ -18,6 +20,8 @@ pub struct StreamingDecoder {
     format: Option<AudioFormat>,
     demuxer: Option<ActiveDemuxer>,
     decoder: Option<ActiveDecoder>,
+    block_format: u8,
+    parts: Vec<AudioPart>,
     finished: bool,
 }
 
@@ -59,6 +63,8 @@ impl StreamingDecoder {
             format: None,
             demuxer: None,
             decoder: None,
+            block_format: 0,
+            parts: Vec::new(),
             finished: false,
         }
     }
@@ -152,11 +158,16 @@ impl StreamingDecoder {
     }
 
     pub fn format(&self) -> Option<AudioFormat> {
-        self.format
+        self.parts.first().map(|part| part.format).or(self.format)
     }
 
     pub fn native_rate(&self) -> Option<u32> {
-        self.format.map(|fmt| fmt.native_sample_rate())
+        self.format().map(|fmt| fmt.native_sample_rate())
+    }
+
+    /// Runs of samples that one block format produced, in output order.
+    pub fn parts(&self) -> &[AudioPart] {
+        &self.parts
     }
 
     fn try_initialize(&mut self, at_end: bool) -> Result<bool> {
@@ -167,7 +178,7 @@ impl StreamingDecoder {
             };
             let codec_pending = header_size.is_some_and(|size| {
                 let start = audio_start(&self.prebuffer, size);
-                find_ds2_format_type(&self.prebuffer, start).is_none()
+                known_ds2_format_type(&self.prebuffer, start).is_none()
             });
             if codec_pending && !at_end {
                 return Ok(false);
@@ -197,6 +208,11 @@ impl StreamingDecoder {
         }
         let variable_rate = codec == 1;
         self.format = Some(format);
+        self.block_format = match format {
+            AudioFormat::Ds2Qp => 6,
+            AudioFormat::Ds2Qp7 => 7,
+            _ => codec,
+        };
         match format {
             AudioFormat::DssSp => {
                 let header_size = dss_header_size(&self.prebuffer).unwrap_or(512);
@@ -239,10 +255,11 @@ impl StreamingDecoder {
             return Ok(Vec::new());
         }
 
+        let tag = self.block_format;
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.push(bytes)?,
-            Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.push(bytes)?,
-            Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.push(bytes)?,
+            Some(ActiveDemuxer::Ds2Qp(demuxer)) => tagged(tag, demuxer.push(bytes)?),
+            Some(ActiveDemuxer::Grundig(demuxer)) => tagged(tag, demuxer.push(bytes)?),
             None => return Ok(Vec::new()),
         };
 
@@ -251,15 +268,13 @@ impl StreamingDecoder {
 
     fn finish_active(&mut self) -> Result<Vec<f64>> {
         if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
-            if qp_frame_in_progress(&self.raw_buf) {
-                return Err(DecodeError::Truncated("DS2 QP frame".to_string()));
-            }
-            return self.decode_buffered_ds2_qp();
+            return self.decode_buffered_ds2_qp(true);
         }
 
+        let tag = self.block_format;
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.finish()?,
-            Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.finish()?,
+            Some(ActiveDemuxer::Ds2Qp(demuxer)) => tagged(tag, demuxer.finish()?),
             Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.finish()?,
             None => Vec::new(),
         };
@@ -269,12 +284,13 @@ impl StreamingDecoder {
 
     fn finish_active_lenient(&mut self) -> Result<Vec<f64>> {
         if matches!(self.format, Some(AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7)) {
-            return self.decode_buffered_ds2_qp();
+            return self.decode_buffered_ds2_qp(false);
         }
 
+        let tag = self.block_format;
         let frames = match self.demuxer.as_mut() {
             Some(ActiveDemuxer::Dss(demuxer)) => demuxer.finish_lenient()?,
-            Some(ActiveDemuxer::Ds2Qp(demuxer)) => demuxer.finish_lenient()?,
+            Some(ActiveDemuxer::Ds2Qp(demuxer)) => tagged(tag, demuxer.finish_lenient()?),
             Some(ActiveDemuxer::Grundig(demuxer)) => demuxer.finish_lenient()?,
             None => Vec::new(),
         };
@@ -282,44 +298,121 @@ impl StreamingDecoder {
         self.decode_frames(frames)
     }
 
-    fn decode_buffered_ds2_qp(&mut self) -> Result<Vec<f64>> {
+    fn decode_buffered_ds2_qp(&mut self, strict: bool) -> Result<Vec<f64>> {
+        let start = ds2_header_size(&self.raw_buf).map(|size| audio_start(&self.raw_buf, size));
+        let layout = start.map(|start| ds2_layout(&self.raw_buf, start));
+        if let (Some(start), Some(Ds2Layout::Walk)) = (start, layout) {
+            let mut demuxer = DssSpStreamDemuxer::with_format(start, self.block_format);
+            let mut frames = demuxer.push(&self.raw_buf)?;
+            frames.extend(if strict {
+                demuxer.finish()?
+            } else {
+                demuxer.finish_lenient()?
+            });
+            return self.decode_frames(frames);
+        }
+
+        if strict && qp_frame_in_progress(&self.raw_buf) {
+            return Err(DecodeError::Truncated("DS2 QP frame".to_string()));
+        }
+        if let (Some(start), Some(Ds2Layout::MixedQp)) = (start, layout) {
+            let (frames, _cut) = mixed_qp_frames(&self.raw_buf, start);
+            return self.decode_frames(frames);
+        }
+
         let demuxed = demux_ds2(&self.raw_buf)?;
-        match (demuxed, self.decoder.as_mut()) {
+        let samples = match (demuxed, self.decoder.as_mut()) {
             (DemuxedDs2::QpSegments { segments, .. }, Some(ActiveDecoder::Ds2Qp(decoder))) => {
-                Ok(decoder.decode_qp_segments(&segments))
+                decoder.decode_qp_segments(&segments)
             }
             (DemuxedDs2::Qp7Segments { segments, .. }, Some(ActiveDecoder::Ds2Qp(decoder))) => {
-                Ok(decoder.decode_qp7_segments(&segments))
+                decoder.decode_qp7_segments(&segments)
             }
-            _ => Ok(Vec::new()),
+            _ => Vec::new(),
+        };
+        if !samples.is_empty() {
+            self.start_part(self.block_format);
+            self.add_to_part(samples.len());
+        }
+        Ok(samples)
+    }
+
+    fn start_part(&mut self, tag: u8) {
+        if !self.parts.is_empty() || decoder_kind(tag) != decoder_kind(self.block_format) {
+            self.decoder = Some(match tag {
+                6 | 7 => ActiveDecoder::Ds2Qp(Ds2QpDecoder::new()),
+                _ => ActiveDecoder::Dss(GrundigSpDecoder::with_variable_rate(tag == 1)),
+            });
+        }
+        let format = match (tag, self.format) {
+            (6, _) => AudioFormat::Ds2Qp,
+            (7, _) => AudioFormat::Ds2Qp7,
+            (_, Some(AudioFormat::DssSp)) => AudioFormat::DssSp,
+            (1, Some(AudioFormat::GrundigSp)) => AudioFormat::DssSp,
+            (_, Some(AudioFormat::GrundigSp)) => AudioFormat::GrundigSp,
+            _ => AudioFormat::Ds2Sp,
+        };
+        let start = self.parts.last().map_or(0, |part| part.start + part.len);
+        self.parts.push(AudioPart {
+            start,
+            len: 0,
+            rate: format.native_sample_rate(),
+            format,
+            block_format: tag,
+        });
+    }
+
+    fn add_to_part(&mut self, len: usize) {
+        if let Some(part) = self.parts.last_mut() {
+            part.len += len;
         }
     }
 
-    fn decode_frames(&mut self, frames: Vec<Vec<u8>>) -> Result<Vec<f64>> {
+    fn decode_frames(&mut self, frames: TaggedFrames) -> Result<Vec<f64>> {
         let mut samples = Vec::new();
-        match self.decoder.as_mut() {
-            Some(ActiveDecoder::Dss(decoder)) => {
-                for frame in frames {
+        for (tag, frame) in frames {
+            if self.parts.last().is_none_or(|part| part.block_format != tag) {
+                self.start_part(tag);
+            }
+            let before = samples.len();
+            match self.decoder.as_mut() {
+                Some(ActiveDecoder::Dss(decoder)) => {
                     let frame_samples = decoder.decode_dss_packet(&frame);
                     samples.extend(frame_samples.into_iter().map(|sample| sample as f64));
                 }
-            }
-            Some(ActiveDecoder::Ds2Qp(decoder)) => {
-                for frame in frames {
+                Some(ActiveDecoder::Ds2Qp(decoder)) if tag == 7 => {
+                    samples.extend(decoder.decode_qp7_segments(&[Ds2Qp7Segment {
+                        records: vec![frame],
+                        total_frames: 1,
+                        reset_before: false,
+                    }]));
+                }
+                Some(ActiveDecoder::Ds2Qp(decoder)) => {
                     samples.extend_from_slice(&decoder.decode_frame(&frame));
                 }
-            }
-            Some(ActiveDecoder::Grundig(decoder)) => {
-                for frame in frames {
+                Some(ActiveDecoder::Grundig(decoder)) => {
                     let frame_samples = decoder.decode_frame(&frame);
                     samples.extend(frame_samples.into_iter().map(|sample| sample as f64));
                 }
+                None => {}
             }
-            None => {}
+            self.add_to_part(samples.len() - before);
         }
 
         Ok(samples)
     }
+}
+
+fn decoder_kind(tag: u8) -> u8 {
+    if tag == 7 {
+        6
+    } else {
+        tag
+    }
+}
+
+fn tagged(tag: u8, frames: Vec<Vec<u8>>) -> TaggedFrames {
+    frames.into_iter().map(|frame| (tag, frame)).collect()
 }
 
 impl DecryptStreamer {
@@ -437,6 +530,11 @@ impl DecryptingDecoderStreamer {
         self.inner.native_rate()
     }
 
+    /// Runs of samples that one block format produced, in output order.
+    pub fn parts(&self) -> &[AudioPart] {
+        self.inner.parts()
+    }
+
     pub(crate) fn finish_lenient(&mut self) -> Result<Vec<f64>> {
         if self.finished {
             return Ok(Vec::new());
@@ -476,6 +574,7 @@ mod tests {
         // detect_ds2_format_type only trusts a block's mode byte when its
         // frame count is non-zero, as in every real recording
         data[0x600 + 2] = 1;
+        data[0x600 + 3] = 0xff;
         data[0x600 + 4] = mode;
         data
     }
@@ -484,6 +583,7 @@ mod tests {
         let mut block = vec![0u8; 512];
         block[1] = 3;
         block[2] = frame_count;
+        block[3] = 0xff;
         for (i, byte) in block[6..].iter_mut().enumerate() {
             *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
         }
@@ -583,6 +683,7 @@ mod tests {
         let mut data = make_ds2_header_only(6);
         data[0x600 + 1] = 3;
         data[0x600 + 2] = 10;
+        data[0x600 + 3] = 0xff;
         data[0x600 + 5] = 0xff;
         for (i, byte) in data[0x600 + 6..].iter_mut().enumerate() {
             *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
@@ -1027,6 +1128,7 @@ mod tests {
         let mut data = vec![0u8; 1024 + 512];
         data[..4].copy_from_slice(b"\x02ds2");
         data[1024 + 2] = 1;
+        data[1024 + 3] = 0xff;
         data[1024 + 4] = 6;
         let mut decoder = StreamingDecoder::new();
         let _ = decoder.push(&data[..1024 + 4]).unwrap();
@@ -1132,5 +1234,483 @@ mod tests {
         let _ = decoder.finish().unwrap();
         let err = decoder.push(b"\x03ds2").unwrap_err();
         assert!(matches!(err, DecodeError::AlreadyFinished));
+    }
+
+    fn joined(prefix: &[u8; 4], header_size: usize, blocks: &[(u8, u8)]) -> Vec<u8> {
+        let mut data = vec![0u8; header_size];
+        data[..4].copy_from_slice(prefix);
+        for &(format, frame_count) in blocks {
+            let mut block = sp_block(frame_count);
+            block[4] = format;
+            data.extend_from_slice(&block);
+        }
+        data
+    }
+
+    fn decode_parts(data: &[u8], chunk: usize) -> (Vec<f64>, Vec<AudioPart>) {
+        let mut decoder = StreamingDecoder::new();
+        let mut samples = Vec::new();
+        for piece in data.chunks(chunk) {
+            samples.extend(decoder.push(piece).unwrap());
+        }
+        samples.extend(decoder.finish().unwrap());
+        (samples, decoder.parts().to_vec())
+    }
+
+    fn part(start: usize, len: usize, format: AudioFormat, block_format: u8) -> AudioPart {
+        AudioPart {
+            start,
+            len,
+            rate: format.native_sample_rate(),
+            format,
+            block_format,
+        }
+    }
+
+    #[test]
+    fn test_streaming_decoder_decodes_each_part_with_its_own_codec() {
+        use AudioFormat::{Ds2Qp, Ds2Qp7, Ds2Sp, DssSp};
+        for (prefix, header_size, first, second, formats) in [
+            (b"\x02dss", 0x400, 0u8, 1u8, [DssSp, DssSp]),
+            (b"\x02dss", 0x400, 1, 0, [DssSp, DssSp]),
+            (b"\x03ds2", 0x600, 0, 6, [Ds2Sp, Ds2Qp]),
+            (b"\x03ds2", 0x600, 1, 7, [Ds2Sp, Ds2Qp7]),
+            (b"\x03ds2", 0x600, 6, 1, [Ds2Qp, Ds2Sp]),
+            (b"\x03ds2", 0x600, 7, 0, [Ds2Qp7, Ds2Sp]),
+            (b"\x03ds2", 0x600, 6, 7, [Ds2Qp, Ds2Qp7]),
+            (b"\x03ds2", 0x600, 7, 6, [Ds2Qp7, Ds2Qp]),
+        ] {
+            let alone = |format| decode_parts(&joined(prefix, header_size, &[(format, 3)]), 100).0;
+            let (head, tail) = (alone(first), alone(second));
+            assert!(!head.is_empty() && !tail.is_empty());
+            assert_ne!(head, tail);
+            let expected = [head.clone(), tail.clone()].concat();
+            let expected_parts = [
+                part(0, head.len(), formats[0], first),
+                part(head.len(), tail.len(), formats[1], second),
+            ];
+            let data = joined(prefix, header_size, &[(first, 3), (second, 3)]);
+            for chunk in [1, 7, 100, data.len()] {
+                let (samples, parts) = decode_parts(&data, chunk);
+                assert_eq!(parts, expected_parts, "{first} then {second}, chunk {chunk}");
+                assert_eq!(samples, expected, "{first} then {second}, chunk {chunk}");
+            }
+            let buffer = crate::decode_to_buffer(&data).unwrap();
+            assert_eq!(buffer.format, formats[0]);
+            assert_eq!(buffer.native_rate, formats[0].native_sample_rate());
+            assert_eq!(buffer.parts, expected_parts);
+            assert_eq!(buffer.samples, expected);
+        }
+    }
+
+    #[test]
+    fn test_unknown_block_format_takes_the_last_format_with_frames() {
+        for (blocks, last) in [
+            (&[(6u8, 3u8), (7, 3), (7, 3)][..], 2),
+            (&[(7, 3), (6, 3), (6, 3)][..], 2),
+            (&[(1, 3), (7, 3), (7, 3)][..], 2),
+            (&[(6, 3), (0, 3), (0, 3)][..], 2),
+            (&[(6, 3), (7, 3), (7, 0), (7, 3)][..], 3),
+        ] {
+            let expected = decode_parts(&joined(b"\x03ds2", 0x600, blocks), 100);
+            for unknown in [3u8, 5, 8, 0xff] {
+                let mut changed = blocks.to_vec();
+                changed[last].0 = unknown;
+                let data = joined(b"\x03ds2", 0x600, &changed);
+                for chunk in [7, data.len()] {
+                    assert_eq!(
+                        decode_parts(&data, chunk),
+                        expected,
+                        "{blocks:?} with {unknown} in block {last}, chunk {chunk}"
+                    );
+                }
+                let buffer = crate::decode_to_buffer(&data).unwrap();
+                assert_eq!((buffer.samples, buffer.parts), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_unknown_format_before_any_known_takes_the_first_known() {
+        for (prefix, header_size, blocks) in [
+            (b"\x03ds2", 0x600, &[(6u8, 3u8), (6, 3)][..]),
+            (b"\x03ds2", 0x600, &[(7, 3), (7, 3)][..]),
+            (b"\x03ds2", 0x600, &[(0, 3), (0, 3)][..]),
+            (b"\x03ds2", 0x600, &[(1, 3), (1, 3)][..]),
+            (b"\x03ds2", 0x600, &[(7, 3), (6, 3)][..]),
+            (b"\x03ds2", 0x600, &[(0, 3), (7, 3)][..]),
+            (b"\x03ds2", 0x600, &[(7, 3), (0, 3)][..]),
+            (b"\x02dss", 0x400, &[(0, 3), (0, 3)][..]),
+            (b"\x02dss", 0x400, &[(1, 3), (1, 3)][..]),
+        ] {
+            let mut known = vec![(blocks[0].0, 3u8), (blocks[0].0, 3)];
+            known.extend_from_slice(blocks);
+            let expected = decode_parts(&joined(prefix, header_size, &known), 100);
+            for unknown in [3u8, 5, 8, 0xff] {
+                let mut changed = known.clone();
+                changed[0].0 = unknown;
+                changed[1].0 = unknown;
+                let data = joined(prefix, header_size, &changed);
+                for chunk in [7, data.len()] {
+                    assert_eq!(
+                        decode_parts(&data, chunk),
+                        expected,
+                        "{blocks:?} after {unknown}, chunk {chunk}"
+                    );
+                }
+                let buffer = crate::decode_to_buffer(&data).unwrap();
+                assert_eq!((buffer.samples, buffer.parts), expected);
+            }
+        }
+        let unknown_only = joined(b"\x03ds2", 0x600, &[(3, 3), (3, 3)]);
+        assert!(matches!(
+            crate::decode_to_buffer(&unknown_only),
+            Err(DecodeError::UnsupportedCodec(3))
+        ));
+    }
+
+    #[test]
+    fn test_file_without_a_qualifying_block_is_refused() {
+        for (prefix, header_size, format) in [
+            (b"\x03ds2", 0x600, 6u8),
+            (b"\x03ds2", 0x600, 7),
+            (b"\x03ds2", 0x600, 1),
+            (b"\x02dss", 0x400, 0),
+            (b"\x02dss", 0x400, 1),
+            (b"\x06dss", 0xc00, 0),
+        ] {
+            let plain = joined(prefix, header_size, &[(format, 3), (format, 3), (3, 3)]);
+            assert!(!crate::decode_to_buffer(&plain).unwrap().samples.is_empty());
+            let mut data = plain.clone();
+            for block in 0..2 {
+                data[header_size + block * 512 + 3] = 0;
+            }
+            for chunk in [7, data.len()] {
+                assert!(
+                    matches!(
+                        stream_decode(&data, chunk),
+                        Err(DecodeError::UnsupportedCodec(0xff))
+                    ),
+                    "{prefix:?} format {format}, chunk {chunk}"
+                );
+            }
+            assert!(matches!(
+                crate::decode_to_buffer(&data),
+                Err(DecodeError::UnsupportedCodec(0xff))
+            ));
+            let demuxed = if prefix[1..] == *b"ds2" {
+                demux_ds2(&data).map(|_| ())
+            } else {
+                crate::demux::dss::demux_dss(&data).map(|_| ())
+            };
+            assert!(matches!(demuxed, Err(DecodeError::UnsupportedCodec(0xff))));
+        }
+    }
+
+    #[test]
+    fn test_block_without_byte_3_ff_does_not_start_a_part() {
+        let ds2_frames = |data: &[u8]| match demux_ds2(data).unwrap() {
+            DemuxedDs2::Sp { packets, .. } => (0, packets),
+            DemuxedDs2::QpSegments { segments, .. } => (
+                6,
+                segments.into_iter().map(|segment| segment.stream).collect(),
+            ),
+            DemuxedDs2::Qp7Segments { segments, .. } => (
+                7,
+                segments
+                    .into_iter()
+                    .flat_map(|segment| segment.records)
+                    .collect(),
+            ),
+        };
+        for (prefix, header_size, format, other, at) in [
+            (b"\x03ds2", 0x600, 6u8, 7u8, 1usize),
+            (b"\x03ds2", 0x600, 7, 6, 1),
+            (b"\x03ds2", 0x600, 1, 6, 1),
+            (b"\x03ds2", 0x600, 6, 0, 1),
+            (b"\x03ds2", 0x600, 6, 7, 0),
+            (b"\x02dss", 0x400, 0, 1, 1),
+            (b"\x02dss", 0x400, 1, 0, 1),
+            (b"\x06dss", 0xc00, 0, 1, 1),
+            (b"\x06dss", 0xc00, 0, 6, 1),
+        ] {
+            let plain = joined(prefix, header_size, &[(format, 3); 3]);
+            let mut blocks = [(format, 3u8); 3];
+            blocks[at].0 = other;
+            let mut data = joined(prefix, header_size, &blocks);
+            data[header_size + at * 512 + 3] = 0;
+            let expected = decode_parts(&plain, 100);
+            for chunk in [7, data.len()] {
+                assert_eq!(
+                    decode_parts(&data, chunk),
+                    expected,
+                    "{prefix:?} format {format} with {other} in block {at}, chunk {chunk}"
+                );
+            }
+            let buffer = crate::decode_to_buffer(&data).unwrap();
+            assert_eq!((buffer.samples, buffer.parts), expected);
+            if prefix[1..] == *b"ds2" {
+                assert_eq!(ds2_frames(&data), ds2_frames(&plain));
+            } else {
+                assert_eq!(
+                    crate::demux::dss::demux_dss(&data).unwrap(),
+                    crate::demux::dss::demux_dss(&plain).unwrap()
+                );
+            }
+            if prefix[0] == 6 {
+                assert_eq!(
+                    crate::demux::grundig::demux_grundig(&data[header_size..]).unwrap(),
+                    crate::demux::grundig::demux_grundig(&plain[header_size..]).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_grundig_file_decodes_each_part_with_its_own_codec() {
+        use AudioFormat::{Ds2Qp, Ds2Qp7, DssSp, GrundigSp};
+        let head = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3)]);
+        let (head_samples, head_parts) = decode_parts(&head, 100);
+        assert_eq!(head_parts, [part(0, head_samples.len(), GrundigSp, 0)]);
+        for (prefix, header_size, second, format) in [
+            (b"\x02dss", 0x400, 1u8, DssSp),
+            (b"\x03ds2", 0x600, 6, Ds2Qp),
+            (b"\x03ds2", 0x600, 7, Ds2Qp7),
+        ] {
+            let alone = joined(prefix, header_size, &[(second, 3), (second, 3)]);
+            let (tail_samples, _) = decode_parts(&alone, 100);
+            let mut data = head.clone();
+            data.extend_from_slice(&alone[header_size..]);
+            let expected = (
+                [head_samples.clone(), tail_samples.clone()].concat(),
+                vec![
+                    part(0, head_samples.len(), GrundigSp, 0),
+                    part(head_samples.len(), tail_samples.len(), format, second),
+                ],
+            );
+            for chunk in [7, data.len()] {
+                assert_eq!(decode_parts(&data, chunk), expected, "0 then {second}");
+            }
+            let buffer = crate::decode_to_buffer(&data).unwrap();
+            assert_eq!(buffer.format, GrundigSp);
+            assert_eq!((buffer.samples, buffer.parts), expected);
+        }
+        for lp in [2u8, 4] {
+            let data = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3), (lp, 3)]);
+            assert!(matches!(
+                crate::decode_to_buffer(&data),
+                Err(DecodeError::UnsupportedCodec(c)) if c == lp
+            ));
+        }
+        for unknown in [3u8, 5, 8, 0xff] {
+            let data = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3), (unknown, 3)]);
+            let same = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3), (0, 3)]);
+            assert_eq!(
+                decode_parts(&data, 100),
+                decode_parts(&same, 100),
+                "{unknown}"
+            );
+        }
+    }
+
+    fn cut_first_frame(format: u8) -> Vec<u8> {
+        let mut block = sp_block(1);
+        block[1] = 253;
+        block[4] = format;
+        block
+    }
+
+    #[test]
+    fn test_first_part_starts_at_the_first_frame() {
+        use AudioFormat::{Ds2Qp, Ds2Sp, DssSp};
+        for (prefix, header_size, first, rest, format) in [
+            (b"\x03ds2", 0x600, 6u8, 0u8, Ds2Sp),
+            (b"\x03ds2", 0x600, 7, 1, Ds2Sp),
+            (b"\x03ds2", 0x600, 0, 6, Ds2Qp),
+            (b"\x03ds2", 0x600, 6, 1, Ds2Sp),
+            (b"\x02dss", 0x400, 0, 1, DssSp),
+        ] {
+            let alone = joined(prefix, header_size, &[(rest, 3), (rest, 3)]);
+            let mut data = vec![0u8; header_size];
+            data[..4].copy_from_slice(prefix);
+            data.extend_from_slice(&cut_first_frame(first));
+            data.extend_from_slice(&alone[header_size..]);
+            let expected = decode_parts(&alone, 100);
+            assert_eq!(expected.1.len(), 1);
+            for chunk in [1, 7, data.len()] {
+                let mut decoder = StreamingDecoder::new();
+                let mut samples = Vec::new();
+                for piece in data.chunks(chunk) {
+                    samples.extend(decoder.push(piece).unwrap());
+                }
+                samples.extend(decoder.finish().unwrap());
+                assert_eq!(
+                    (samples, decoder.parts().to_vec()),
+                    expected,
+                    "{first} then {rest}"
+                );
+                assert_eq!(decoder.format(), Some(format));
+                assert_eq!(decoder.native_rate(), Some(format.native_sample_rate()));
+            }
+            let buffer = crate::decode_to_buffer(&data).unwrap();
+            assert_eq!(buffer.format, format);
+            assert_eq!(buffer.native_rate, format.native_sample_rate());
+            assert_eq!((buffer.samples, buffer.parts), expected);
+            if prefix == b"\x03ds2" {
+                let kind = |data: &[u8]| match demux_ds2(data).unwrap() {
+                    DemuxedDs2::Sp { packets, .. } => (0, packets),
+                    DemuxedDs2::QpSegments { segments, .. } => {
+                        (6, segments.into_iter().map(|seg| seg.stream).collect())
+                    }
+                    DemuxedDs2::Qp7Segments { segments, .. } => (
+                        7,
+                        segments.into_iter().flat_map(|seg| seg.records).collect(),
+                    ),
+                };
+                let one_part = joined(prefix, header_size, &[(rest, 3)]);
+                let mut cut = vec![0u8; header_size];
+                cut[..4].copy_from_slice(prefix);
+                cut.extend_from_slice(&cut_first_frame(first));
+                cut.extend_from_slice(&one_part[header_size..]);
+                assert_eq!(kind(&cut), kind(&one_part), "demux {first} then {rest}");
+            }
+        }
+        let mut dss = vec![0u8; 0x400];
+        dss[..4].copy_from_slice(b"\x02dss");
+        dss.extend_from_slice(&cut_first_frame(0));
+        dss.extend_from_slice(&joined(b"\x02dss", 0x400, &[(6, 3)])[0x400..]);
+        assert!(matches!(
+            crate::demux::dss::demux_dss(&dss),
+            Err(DecodeError::UnsupportedCodec(6))
+        ));
+    }
+
+    #[test]
+    fn test_strict_finish_fails_on_a_cut_qp_part() {
+        for blocks in [&[(1u8, 3u8), (6, 8)][..], &[(6, 3), (1, 3), (6, 8)][..]] {
+            let data = joined(b"\x03ds2", 0x600, blocks);
+            let last = data.len() - 512 + 6;
+            for (cut, fails) in [
+                (last + 3 * 56, true),
+                (last + 3 * 56 + 20, true),
+                (last + 8 * 56 - 1, true),
+                (last + 8 * 56, false),
+                (data.len(), false),
+            ] {
+                let mut decoder = StreamingDecoder::new();
+                let mut samples = decoder.push(&data[..cut]).unwrap();
+                match decoder.finish() {
+                    Err(DecodeError::Truncated(what)) => {
+                        assert!(fails, "{blocks:?} cut at {cut}");
+                        assert_eq!(what, "DS2 QP frame");
+                    }
+                    Ok(tail) => {
+                        assert!(!fails, "{blocks:?} cut at {cut}");
+                        samples.extend(tail);
+                    }
+                    Err(other) => panic!("{blocks:?} cut at {cut}: {other}"),
+                }
+                let lenient = crate::decode_to_buffer(&data[..cut]).unwrap();
+                if !fails {
+                    assert_eq!(samples, lenient.samples);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_streaming_decoder_single_format_file_is_one_part() {
+        use AudioFormat::{Ds2Qp, Ds2Qp7, Ds2Sp, DssSp, GrundigSp};
+        for (data, format, block_format) in [
+            (joined(b"\x02dss", 0x400, &[(0, 3), (0, 2)]), DssSp, 0),
+            (joined(b"\x02dss", 0x400, &[(1, 3), (1, 2)]), DssSp, 1),
+            (dss_with_header_blocks(6, 0), GrundigSp, 0),
+            (joined(b"\x03ds2", 0x600, &[(1, 3), (1, 2)]), Ds2Sp, 1),
+            (joined(b"\x03ds2", 0x600, &[(6, 3), (6, 2)]), Ds2Qp, 6),
+            (joined(b"\x03ds2", 0x600, &[(7, 3), (7, 2)]), Ds2Qp7, 7),
+        ] {
+            let (samples, parts) = decode_parts(&data, 7);
+            assert!(!samples.is_empty());
+            assert_eq!(parts, [part(0, samples.len(), format, block_format)]);
+            assert_eq!(crate::decode_to_buffer(&data).unwrap().parts, parts);
+        }
+        let empty = joined(b"\x02dss", 0x400, &[(0, 0)]);
+        assert_eq!(decode_parts(&empty, 7), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn test_streaming_decoder_refuses_lp_part() {
+        for (prefix, header_size, first) in
+            [(b"\x02dss", 0x400, 0u8), (b"\x03ds2", 0x600, 1), (b"\x03ds2", 0x600, 6)]
+        {
+            let (head, head_parts) = decode_parts(&joined(prefix, header_size, &[(first, 3)]), 100);
+            for lp in [2u8, 4] {
+                let data = joined(prefix, header_size, &[(first, 3), (lp, 3)]);
+                for chunk in [1, 7, data.len()] {
+                    let mut decoder = StreamingDecoder::new();
+                    let mut samples = Vec::new();
+                    let mut err = None;
+                    for piece in data.chunks(chunk) {
+                        match decoder.push(piece) {
+                            Ok(more) => samples.extend(more),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    let err = err.or_else(|| decoder.finish().err());
+                    assert!(matches!(err, Some(DecodeError::UnsupportedCodec(c)) if c == lp));
+                    if first == 6 {
+                        assert!(samples.is_empty());
+                    } else {
+                        assert_eq!(samples, head);
+                        assert_eq!(decoder.parts(), head_parts);
+                    }
+                }
+                assert!(matches!(
+                    crate::decode_to_buffer(&data),
+                    Err(DecodeError::UnsupportedCodec(c)) if c == lp
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_demux_refuses_more_than_one_part() {
+        let frames = |data: &[u8]| match demux_ds2(data).unwrap() {
+            DemuxedDs2::Sp { total_frames, .. } => (0, total_frames),
+            DemuxedDs2::QpSegments { total_frames, .. } => (6, total_frames),
+            DemuxedDs2::Qp7Segments { total_frames, .. } => (7, total_frames),
+        };
+        for (first, second, kind) in [
+            (1u8, 6u8, 0),
+            (1, 4, 0),
+            (6, 0, 6),
+            (6, 2, 6),
+            (6, 7, 6),
+            (7, 6, 7),
+        ] {
+            let data = joined(b"\x03ds2", 0x600, &[(first, 3), (second, 4)]);
+            assert!(
+                matches!(demux_ds2(&data), Err(DecodeError::MultipleParts(f)) if f == second),
+                "{first} then {second}"
+            );
+            let data = joined(b"\x03ds2", 0x600, &[(first, 3), (first, 4)]);
+            assert_eq!(frames(&data), (kind, 7), "{first} alone");
+        }
+        for second in [1u8, 2] {
+            let dss = joined(b"\x02dss", 0x400, &[(0, 3), (second, 4)]);
+            assert!(
+                matches!(
+                    crate::demux::dss::demux_dss(&dss),
+                    Err(DecodeError::MultipleParts(f)) if f == second
+                ),
+                "dss 0 then {second}"
+            );
+        }
+        let dss = joined(b"\x02dss", 0x400, &[(0, 3), (0, 4)]);
+        let (packets, total) = crate::demux::dss::demux_dss(&dss).unwrap();
+        assert_eq!((packets.len(), total), (7, 7));
     }
 }

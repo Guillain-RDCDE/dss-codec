@@ -67,7 +67,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() >= 0x600 + DS2_BLOCK_HEADER_SIZE {
-        let format_type = data[0x600 + 4];
+        let format_type = crate::demux::dss::header_format(&data[0x600..]);
         return Some(match format_type {
             7 => AudioFormat::Ds2Qp7,
             6 => AudioFormat::Ds2Qp,
@@ -136,6 +136,7 @@ mod tests {
     fn make_ds2_like_file(magic: [u8; 4], mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 0x200];
         data[..4].copy_from_slice(&magic);
+        data[0x600 + 3] = 0xff;
         data[0x600 + 4] = mode;
         data
     }
@@ -164,6 +165,7 @@ mod tests {
         data[0] = first_byte;
         data[1..4].copy_from_slice(b"ds2");
         data[header_size + 2] = 1;
+        data[header_size + 3] = 0xff;
         data[header_size + 4] = mode;
         data
     }
@@ -183,6 +185,7 @@ mod tests {
     #[test]
     fn ds2_header_size_reads_one_block_when_next_block_is_audio() {
         let mut data = make_ds2_with_header_blocks(1, 1, 6);
+        data[0x203] = 0;
         assert_eq!(ds2_header_size(&data), Some(1536));
         assert_eq!(detect_format(&data), None);
         data[0x203] = 0xff;
@@ -229,6 +232,7 @@ mod tests {
         data[1..4].copy_from_slice(b"dss");
         assert_eq!(detect_format(&data), Some(AudioFormat::GrundigSp));
         for codec in [1u8, 2, 6, 0xff] {
+            data[6 * 512 + 3] = 0xff;
             data[6 * 512 + 4] = codec;
             assert_eq!(detect_format(&data), Some(AudioFormat::DssSp));
             assert_eq!(sp_codec(&data), Some(codec));

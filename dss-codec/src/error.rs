@@ -17,6 +17,9 @@ pub enum DecodeError {
     #[error("unsupported audio codec: {0}")]
     UnsupportedCodec(u8),
 
+    #[error("file holds more than one part, the second in block format {0}")]
+    MultipleParts(u8),
+
     #[error("encrypted DS2 error: {0}")]
     EncryptedDs2(String),
 

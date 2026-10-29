@@ -13,6 +13,9 @@
 //! The whole audio region is buffered and demuxed at `finish`, because frame
 //! extraction needs each block's `frame_count` and the cross-block bit reads.
 
+use crate::demux::dss::{
+    block_frames, header_format, part_format, DssSpStreamDemuxer, TaggedFrames,
+};
 use crate::error::{DecodeError, Result};
 
 const BLOCK_SIZE: usize = 512;
@@ -34,10 +37,21 @@ fn read_bit(payload: &[u8], bit_index: usize) -> u8 {
 }
 
 /// Demux a Grundig audio region (after the header blocks) into 41-byte frames.
-pub fn demux_grundig(audio: &[u8]) -> (Vec<Vec<u8>>, usize) {
+pub fn demux_grundig(audio: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
+    if let Some(other) = other_part(audio) {
+        return Err(DecodeError::MultipleParts(audio[other * BLOCK_SIZE + 4]));
+    }
     let (frames, _cut) = grundig_frames(audio);
     let total = frames.len();
-    (frames, total)
+    Ok((frames, total))
+}
+
+fn other_part(audio: &[u8]) -> Option<usize> {
+    audio.chunks(BLOCK_SIZE).position(|blk| {
+        blk.len() >= HEADER_SIZE
+            && block_frames(blk) > 0
+            && part_format(header_format(blk)).is_some_and(|format| format != 0)
+    })
 }
 
 fn grundig_frames(audio: &[u8]) -> (Vec<Vec<u8>>, bool) {
@@ -99,19 +113,14 @@ impl GrundigSpStreamDemuxer {
         Ok(Vec::new())
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn finish(&mut self) -> Result<TaggedFrames> {
         self.check_header()?;
-        let (frames, cut) = self.demux_all();
-        let tail = self.buf.len().saturating_sub(self.header_size);
-        if cut && !tail.is_multiple_of(BLOCK_SIZE) {
-            return Err(DecodeError::Truncated("Grundig SP frame".to_string()));
-        }
-        Ok(frames)
+        self.demux_all(true)
     }
 
-    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<Vec<u8>>> {
+    pub(crate) fn finish_lenient(&mut self) -> Result<TaggedFrames> {
         self.check_header()?;
-        Ok(self.demux_all().0)
+        self.demux_all(false)
     }
 
     fn check_header(&self) -> Result<()> {
@@ -121,12 +130,49 @@ impl GrundigSpStreamDemuxer {
         Ok(())
     }
 
-    fn demux_all(&mut self) -> (Vec<Vec<u8>>, bool) {
+    fn demux_all(&mut self, strict: bool) -> Result<TaggedFrames> {
         if self.buf.len() <= self.header_size {
-            return (Vec::new(), false);
+            return Ok(Vec::new());
         }
-        grundig_frames(&self.buf[self.header_size..])
+        let audio = &self.buf[self.header_size..];
+        let Some(other) = other_part(audio) else {
+            let (frames, cut) = grundig_frames(audio);
+            if strict && cut && !audio.len().is_multiple_of(BLOCK_SIZE) {
+                return Err(DecodeError::Truncated("Grundig SP frame".to_string()));
+            }
+            return Ok(frames.into_iter().map(|frame| (0, frame)).collect());
+        };
+
+        let mut frames: TaggedFrames = grundig_frames(&audio[..other * BLOCK_SIZE])
+            .0
+            .into_iter()
+            .map(|frame| (0, frame))
+            .collect();
+        let mut rest = DssSpStreamDemuxer::with_format(self.header_size + other * BLOCK_SIZE, 0);
+        let mut more = rest.push(&self.buf)?;
+        more.extend(if strict {
+            rest.finish()?
+        } else {
+            rest.finish_lenient()?
+        });
+        let lead = more.iter().take_while(|(tag, _)| *tag == 0).count();
+        for (index, (tag, packet)) in more.into_iter().enumerate() {
+            if index < lead {
+                frames.push((0, packet_frame(&packet)));
+            } else {
+                frames.push((tag, packet));
+            }
+        }
+        Ok(frames)
     }
+}
+
+fn packet_frame(packet: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; FRAME_BITS / 8];
+    for (i, byte) in frame.iter_mut().enumerate() {
+        *byte = packet.get(i ^ 1).copied().unwrap_or(0);
+    }
+    frame
 }
 
 #[cfg(test)]
@@ -177,11 +223,16 @@ mod tests {
         for piece in file.chunks(37) {
             assert!(demuxer.push(piece).unwrap().is_empty());
         }
-        if strict {
+        let frames = if strict {
             demuxer.finish()
         } else {
             demuxer.finish_lenient()
-        }
+        };
+        frames.map(untagged)
+    }
+
+    fn untagged(frames: TaggedFrames) -> Vec<Vec<u8>> {
+        frames.into_iter().map(|(_, frame)| frame).collect()
     }
 
     #[test]
@@ -189,7 +240,7 @@ mod tests {
         let data = [block(0x00, 255, 2, 1), block(0x00, 53, 1, 2)].concat();
         let bits = payload_bits(&data);
 
-        let (frames, total) = demux_grundig(&data);
+        let (frames, total) = demux_grundig(&data).unwrap();
         assert_eq!(total, 3);
         assert_eq!(
             frames,
@@ -206,7 +257,7 @@ mod tests {
         let data = [block(0x00, 3, 1, 1), block(0x40, 13, 2, 2)].concat();
         let bits = payload_bits(&data);
 
-        let (frames, total) = demux_grundig(&data);
+        let (frames, total) = demux_grundig(&data).unwrap();
         assert_eq!(total, 3);
         assert_eq!(
             frames,
@@ -223,7 +274,7 @@ mod tests {
         let whole = [block(0x00, 3, 13, 1), block(0x80, 16, 1, 2)].concat();
         let bits = payload_bits(&whole);
 
-        let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + HEADER_SIZE + 70]);
+        let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + HEADER_SIZE + 70]).unwrap();
         assert_eq!(total, 14);
         let mut expected = frames_from(&bits, 13);
         expected.push(frame_at(&bits, 4048 + 216));
@@ -243,7 +294,7 @@ mod tests {
         file[..4].copy_from_slice(b"\x06dss");
         file.extend_from_slice(audio);
 
-        let (expected, total) = demux_grundig(audio);
+        let (expected, total) = demux_grundig(audio).unwrap();
         assert_eq!(total, 29);
         let mut strict = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
         let mut lenient = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
@@ -251,8 +302,8 @@ mod tests {
             assert!(strict.push(piece).unwrap().is_empty());
             assert!(lenient.push(piece).unwrap().is_empty());
         }
-        assert_eq!(strict.finish().unwrap(), expected);
-        assert_eq!(lenient.finish_lenient().unwrap(), expected);
+        assert_eq!(untagged(strict.finish().unwrap()), expected);
+        assert_eq!(untagged(lenient.finish_lenient().unwrap()), expected);
     }
 
     #[test]
@@ -270,7 +321,7 @@ mod tests {
             ));
             let lenient = stream_finish(&file, false).unwrap();
             assert!(!lenient.is_empty());
-            assert_eq!(lenient, demux_grundig(audio).0);
+            assert_eq!(lenient, demux_grundig(audio).unwrap().0);
         }
     }
 
@@ -286,7 +337,7 @@ mod tests {
                 Err(DecodeError::Truncated(what)) if what == "Grundig SP frame"
             ));
             assert_eq!(stream_finish(&file, false).unwrap(), frames_from(&bits, 12));
-            assert_eq!(demux_grundig(audio).0, frames_from(&bits, 12));
+            assert_eq!(demux_grundig(audio).unwrap().0, frames_from(&bits, 12));
         }
     }
 
@@ -299,7 +350,7 @@ mod tests {
             let strict = stream_finish(&file, true).unwrap();
             assert_eq!(strict.len(), 12);
             assert_eq!(strict, stream_finish(&file, false).unwrap());
-            assert_eq!(strict, demux_grundig(audio).0);
+            assert_eq!(strict, demux_grundig(audio).unwrap().0);
         }
     }
 
@@ -335,7 +386,7 @@ mod tests {
             let data = block(b0, b1, 2, 1);
             let bits = payload_bits(&data);
 
-            let (frames, total) = demux_grundig(&data);
+            let (frames, total) = demux_grundig(&data).unwrap();
             assert_eq!(total, 2);
             assert_eq!(frames, frames_from(&bits, 2));
         }
@@ -346,7 +397,7 @@ mod tests {
         let whole = [block(0x00, 3, 13, 1), block(0x80, 16, 1, 2)].concat();
         let bits = payload_bits(&whole);
 
-        let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + HEADER_SIZE + 20]);
+        let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + HEADER_SIZE + 20]).unwrap();
         assert_eq!(total, 12);
         assert_eq!(frames, frames_from(&bits, 12));
     }
@@ -356,7 +407,7 @@ mod tests {
         let data = block(0x00, 3, 255, 1);
         let bits = payload_bits(&data);
 
-        let (frames, total) = demux_grundig(&data);
+        let (frames, total) = demux_grundig(&data).unwrap();
         assert_eq!(total, 12);
         assert_eq!(frames, frames_from(&bits, 12));
     }
@@ -366,7 +417,7 @@ mod tests {
         let data = [block(0x00, 3, 14, 1), block(0x80, 16, 1, 2)].concat();
         let bits = payload_bits(&data);
 
-        let (frames, total) = demux_grundig(&data);
+        let (frames, total) = demux_grundig(&data).unwrap();
         assert_eq!(total, 15);
         let mut expected = frames_from(&bits, 14);
         expected.push(frame_at(&bits, 4048 + 216));
@@ -379,7 +430,7 @@ mod tests {
         let bits = payload_bits(&whole);
 
         for cut in [1, HEADER_SIZE - 1, HEADER_SIZE, HEADER_SIZE + 1] {
-            let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + cut]);
+            let (frames, total) = demux_grundig(&whole[..BLOCK_SIZE + cut]).unwrap();
             assert_eq!(total, 2);
             assert_eq!(frames, frames_from(&bits, 2));
         }
@@ -390,11 +441,11 @@ mod tests {
         let data = block(0x00, 3, 1, 1);
         let bits = payload_bits(&data);
 
-        let (frames, total) = demux_grundig(&data[..HEADER_SIZE + 41]);
+        let (frames, total) = demux_grundig(&data[..HEADER_SIZE + 41]).unwrap();
         assert_eq!(total, 0);
         assert!(frames.is_empty());
 
-        let (frames, total) = demux_grundig(&data[..HEADER_SIZE + 42]);
+        let (frames, total) = demux_grundig(&data[..HEADER_SIZE + 42]).unwrap();
         assert_eq!(total, 1);
         assert_eq!(frames, frames_from(&bits, 1));
     }
@@ -402,11 +453,51 @@ mod tests {
     #[test]
     fn test_grundig_blocks_without_frames_give_nothing() {
         let data = [block(0x00, 3, 0, 1), block(0x00, 3, 0, 2)].concat();
-        assert_eq!(demux_grundig(&data), (Vec::<Vec<u8>>::new(), 0));
-        assert_eq!(demux_grundig(&[]), (Vec::<Vec<u8>>::new(), 0));
+        assert_eq!(demux_grundig(&data).unwrap(), (Vec::<Vec<u8>>::new(), 0));
+        assert_eq!(demux_grundig(&[]).unwrap(), (Vec::<Vec<u8>>::new(), 0));
 
         let mut demuxer = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
         assert!(demuxer.push(&[0u8; 6 * BLOCK_SIZE]).unwrap().is_empty());
         assert!(demuxer.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_demux_grundig_refuses_a_second_part() {
+        let with = |format: u8, count: u8, seed: u8| {
+            let mut blk = block(0x00, 3, count, seed);
+            blk[4] = format;
+            blk
+        };
+        let as_grundig = |data: &[u8]| {
+            let mut data = data.to_vec();
+            for blk in data.chunks_mut(BLOCK_SIZE) {
+                blk[4] = 0;
+            }
+            demux_grundig(&data).unwrap()
+        };
+        for format in [1u8, 2, 4, 6, 7] {
+            let data = [with(0, 2, 1), with(0, 2, 2), with(format, 2, 3)].concat();
+            assert!(
+                matches!(
+                    demux_grundig(&data),
+                    Err(DecodeError::MultipleParts(f)) if f == format
+                ),
+                "0 then {format}"
+            );
+            let data = [with(0, 2, 1), with(format, 0, 2), with(0, 2, 3)].concat();
+            assert_eq!(demux_grundig(&data).unwrap(), as_grundig(&data));
+        }
+        let data = [with(0, 2, 1), with(1, 0, 2), with(6, 2, 3)].concat();
+        assert!(matches!(
+            demux_grundig(&data),
+            Err(DecodeError::MultipleParts(6))
+        ));
+        for unknown in [3u8, 5, 8, 255] {
+            let data = [with(0, 2, 1), with(unknown, 2, 2), with(0, 2, 3)].concat();
+            let bits = payload_bits(&data);
+            let expected = [0, 328, 4048, 4376, 8096, 8424].map(|pos| frame_at(&bits, pos));
+            assert_eq!(demux_grundig(&data).unwrap(), (expected.to_vec(), 6));
+            assert_eq!(demux_grundig(&data).unwrap(), as_grundig(&data));
+        }
     }
 }

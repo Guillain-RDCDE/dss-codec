@@ -10,7 +10,7 @@ pub mod tables;
 use crate::crypto::ds2_encrypted::ENCRYPTED_MAGIC;
 use crate::demux::{detect_format, AudioFormat};
 use crate::error::{DecodeError, Result};
-use crate::output::resample::resample;
+use crate::output::resample::{resample, resample_aligned};
 use crate::output::wav::write_wav;
 use crate::output::OutputConfig;
 use crate::streaming::{DecryptStreamer, DecryptingDecoderStreamer};
@@ -25,6 +25,23 @@ pub struct AudioBuffer {
     pub native_rate: u32,
     /// Detected format
     pub format: AudioFormat,
+    /// Runs of samples that one block format produced, in order
+    pub parts: Vec<AudioPart>,
+}
+
+/// A run of samples that one block format produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPart {
+    /// Index of the part's first sample in the buffer
+    pub start: usize,
+    /// Number of samples in the part
+    pub len: usize,
+    /// Sample rate of the part's samples
+    pub rate: u32,
+    /// Format of the part's frames
+    pub format: AudioFormat,
+    /// Format byte of the part's audio blocks
+    pub block_format: u8,
 }
 
 /// Lightweight file/container inspection result.
@@ -119,24 +136,6 @@ pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
 
 /// Decode raw file bytes to an AudioBuffer, optionally decrypting encrypted DS2 input first.
 pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> Result<AudioBuffer> {
-    if detect_format(data) == Some(AudioFormat::DssSp) {
-        let (packets, _total) = crate::demux::dss::demux_dss(data)?;
-        let variable_rate = crate::demux::sp_codec(data) == Some(1);
-        let mut decoder =
-            crate::codec::grundig_sp::GrundigSpDecoder::with_variable_rate(variable_rate);
-        let mut samples = Vec::new();
-        for pkt in &packets {
-            for s in decoder.decode_dss_packet(pkt) {
-                samples.push(s as f64);
-            }
-        }
-        return Ok(AudioBuffer {
-            samples,
-            native_rate: AudioFormat::DssSp.native_sample_rate(),
-            format: AudioFormat::DssSp,
-        });
-    }
-
     let mut decoder = DecryptingDecoderStreamer::new(password);
     let mut samples = decoder.push(data)?;
     samples.extend(decoder.finish_lenient()?);
@@ -150,6 +149,7 @@ pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> R
         samples,
         native_rate: format.native_sample_rate(),
         format,
+        parts: decoder.parts().to_vec(),
     })
 }
 
@@ -172,8 +172,27 @@ pub fn decode_and_write_with_password(
 
     let target_rate = config.sample_rate.unwrap_or(buf.native_rate);
 
-    if target_rate != buf.native_rate {
+    if buf.parts.len() > 1 {
+        let mut samples = Vec::new();
+        for part in &mut buf.parts {
+            let part_samples = &buf.samples[part.start..part.start + part.len];
+            let part_samples = if part.rate == target_rate {
+                part_samples.to_vec()
+            } else {
+                resample_aligned(part_samples, part.rate, target_rate)?
+            };
+            part.start = samples.len();
+            part.len = part_samples.len();
+            part.rate = target_rate;
+            samples.extend(part_samples);
+        }
+        buf.samples = samples;
+    } else if target_rate != buf.native_rate {
         buf.samples = resample(&buf.samples, buf.native_rate, target_rate)?;
+        for part in &mut buf.parts {
+            part.len = buf.samples.len();
+            part.rate = target_rate;
+        }
     }
 
     write_wav(
@@ -197,6 +216,7 @@ mod inspection_tests {
         data[..4].copy_from_slice(&ENCRYPTED_MAGIC);
         data[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + 2]
             .copy_from_slice(&mode.to_le_bytes());
+        data[0x603] = 0xff;
         data[0x604] = format_type;
         data
     }

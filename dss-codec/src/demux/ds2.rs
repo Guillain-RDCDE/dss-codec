@@ -4,7 +4,7 @@
 /// QP mode (6): 56-byte frames, read from each block's anchor and across
 /// block boundaries.
 /// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
-use crate::demux::dss::{block_frames, dss_sp_frames};
+use crate::demux::dss::{block_frames, dss_single_part, header_format, part_format, TaggedFrames};
 use crate::demux::{audio_start, check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
 
@@ -30,18 +30,67 @@ pub struct Ds2Qp7Segment {
 }
 
 pub(crate) fn find_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
+    let mut unknown = None;
     let mut bstart = header_size;
     while bstart + DS2_BLOCK_HEADER_SIZE <= data.len() {
-        if block_frames(&data[bstart..bstart + DS2_BLOCK_HEADER_SIZE]) > 0 {
-            return Some(data[bstart + 4]);
+        let hdr = &data[bstart..bstart + DS2_BLOCK_HEADER_SIZE];
+        if block_frames(hdr) > 0 {
+            let format = header_format(hdr);
+            if part_format(format).is_some() {
+                return Some(format);
+            }
+            unknown = unknown.or(Some(format));
         }
         bstart += DS2_BLOCK_SIZE;
     }
-    None
+    unknown
+}
+
+pub(crate) fn known_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
+    find_ds2_format_type(data, header_size).filter(|format| part_format(*format).is_some())
 }
 
 pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
     find_ds2_format_type(data, header_size).unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ds2Layout {
+    Single,
+    Walk,
+    MixedQp,
+}
+
+pub(crate) fn block_format(last: &mut Option<u8>, hdr: &[u8]) -> u8 {
+    let format = header_format(hdr);
+    if part_format(format).is_none() {
+        return last.unwrap_or(format);
+    }
+    if block_frames(hdr) > 0 {
+        *last = Some(format);
+    }
+    format
+}
+
+pub(crate) fn ds2_layout(data: &[u8], header_size: usize) -> Ds2Layout {
+    let mut formats = 0u32;
+    let mut last = known_ds2_format_type(data, header_size);
+    let mut pos = header_size;
+    while pos + DS2_BLOCK_HEADER_SIZE <= data.len() {
+        let hdr = &data[pos..pos + DS2_BLOCK_HEADER_SIZE];
+        let format = block_format(&mut last, hdr);
+        if format < 8 && block_frames(hdr) > 0 {
+            formats |= 1 << format;
+        }
+        pos += DS2_BLOCK_SIZE;
+    }
+    if formats & (1 << 0 | 1 << 1 | 1 << 2 | 1 << 4) != 0 {
+        Ds2Layout::Walk
+    } else if formats == (1 << 6 | 1 << 7) {
+        Ds2Layout::MixedQp
+    } else {
+        Ds2Layout::Single
+    }
 }
 
 /// Demux a DS2 file.
@@ -54,14 +103,41 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
         .ok_or_else(|| DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")))?;
     let format_type = detect_ds2_format_type(data, header_size);
 
-    if format_type == 7 {
-        let (records, _cut) = qp_frames(data, header_size, true);
-        let total_frames = records.len();
-        let segments = if records.is_empty() {
+    let tagged = if format_type == 6 || format_type == 7 {
+        match ds2_layout(data, header_size) {
+            Ds2Layout::Single => qp_frames(data, header_size, format_type == 7)
+                .0
+                .into_iter()
+                .map(|frame| (format_type, frame))
+                .collect(),
+            Ds2Layout::Walk => dss_single_part(data, header_size, format_type)?.0,
+            Ds2Layout::MixedQp => {
+                let tagged = mixed_qp_frames(data, header_size).0;
+                let first = tagged.first().map(|(tag, _)| *tag);
+                if let Some((tag, _)) = tagged.iter().find(|(tag, _)| Some(*tag) != first) {
+                    return Err(DecodeError::MultipleParts(*tag));
+                }
+                tagged
+            }
+        }
+    } else {
+        check_sp_codec(format_type)?;
+        dss_single_part(data, header_size, format_type)?.0
+    };
+    let kind = tagged.first().map_or(format_type, |(tag, _)| *tag);
+    let frames: Vec<Vec<u8>> = tagged.into_iter().map(|(_, frame)| frame).collect();
+    let total_frames = frames.len();
+    if kind == 0 || kind == 1 {
+        Ok(DemuxedDs2::Sp {
+            total_frames,
+            packets: frames,
+        })
+    } else if kind == 7 {
+        let segments = if frames.is_empty() {
             Vec::new()
         } else {
             vec![Ds2Qp7Segment {
-                records,
+                records: frames,
                 total_frames,
                 reset_before: false,
             }]
@@ -70,9 +146,7 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             segments,
             total_frames,
         })
-    } else if format_type == 6 {
-        let (frames, _cut) = qp_frames(data, header_size, false);
-        let total_frames = frames.len();
+    } else {
         let segments = if frames.is_empty() {
             Vec::new()
         } else {
@@ -86,25 +160,27 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             segments,
             total_frames,
         })
-    } else {
-        check_sp_codec(format_type)?;
-        let (packets, _cut) = dss_sp_frames(data, header_size, format_type == 1);
-        Ok(DemuxedDs2::Sp {
-            total_frames: packets.len(),
-            packets,
-        })
     }
 }
 
-fn block_anchor(hdr: &[u8]) -> usize {
+pub(crate) fn block_anchor(hdr: &[u8]) -> usize {
     (2 * hdr[1] as usize + 2 * (hdr[0] >> 7) as usize)
         .saturating_sub(DS2_BLOCK_HEADER_SIZE)
         .min(DS2_BLOCK_PAYLOAD_SIZE)
 }
 
-fn block_frames_held(block: &[u8], qp7: bool) -> (usize, usize) {
+fn qp_block_frames(hdr: &[u8], format: u8, mixed: bool) -> usize {
+    if mixed && format != 6 && format != 7 {
+        0
+    } else {
+        block_frames(hdr)
+    }
+}
+
+fn block_frames_held(block: &[u8], format: u8, qp7: bool, mixed: bool) -> (usize, usize) {
     let size = block.len();
-    let frame_count = block_frames(block);
+    let frame_count = qp_block_frames(block, format, mixed);
+    let qp7 = if mixed { format == 7 } else { qp7 };
     let mut n = 0;
     let mut off = DS2_BLOCK_HEADER_SIZE + block_anchor(block);
     while n < frame_count && off < size {
@@ -123,14 +199,16 @@ fn block_frames_held(block: &[u8], qp7: bool) -> (usize, usize) {
     (n, need)
 }
 
-fn frame_dropped(data: &[u8], mut pos: usize, mut need: usize) -> bool {
+fn frame_dropped(data: &[u8], mut pos: usize, mut need: usize, format: u8, mixed: bool) -> bool {
+    let mut last = Some(format);
     while need > 0 {
         pos += DS2_BLOCK_SIZE;
         let hdr = match data.get(pos..pos + DS2_BLOCK_HEADER_SIZE) {
             Some(hdr) => hdr,
             None => return false,
         };
-        if block_frames(hdr) != 0 {
+        let format = block_format(&mut last, hdr);
+        if qp_block_frames(hdr, format, mixed) != 0 {
             return block_anchor(hdr) != need;
         }
         need = need.saturating_sub(block_anchor(hdr));
@@ -138,13 +216,15 @@ fn frame_dropped(data: &[u8], mut pos: usize, mut need: usize) -> bool {
     false
 }
 
-fn count_qp_frames(data: &[u8], header_size: usize, qp7: bool) -> usize {
+fn count_qp_frames(data: &[u8], header_size: usize, qp7: bool, mixed: bool) -> usize {
     let mut total = 0;
+    let mut last = known_ds2_format_type(data, header_size);
     let mut pos = header_size;
     while pos + DS2_BLOCK_HEADER_SIZE <= data.len() {
         let block = &data[pos..data.len().min(pos + DS2_BLOCK_SIZE)];
-        let (n, need) = block_frames_held(block, qp7);
-        total += if need > 0 && frame_dropped(data, pos, need) {
+        let format = block_format(&mut last, block);
+        let (n, need) = block_frames_held(block, format, qp7, mixed);
+        total += if need > 0 && frame_dropped(data, pos, need, format, mixed) {
             n - 1
         } else {
             n
@@ -158,6 +238,10 @@ struct QpFrameReader<'a> {
     data: &'a [u8],
     pos: usize,
     qp7: bool,
+    mixed: bool,
+    last_format: Option<u8>,
+    block_format: u8,
+    frame_format: u8,
     total_frames: usize,
     frames_read: usize,
     counter: usize,
@@ -167,7 +251,34 @@ struct QpFrameReader<'a> {
     cut: bool,
 }
 
-impl QpFrameReader<'_> {
+impl<'a> QpFrameReader<'a> {
+    fn new(data: &'a [u8], header_size: usize, qp7: bool, mixed: bool) -> Self {
+        Self {
+            data,
+            pos: header_size,
+            qp7,
+            mixed,
+            last_format: known_ds2_format_type(data, header_size),
+            block_format: 0,
+            frame_format: 0,
+            total_frames: count_qp_frames(data, header_size, qp7, mixed),
+            frames_read: 0,
+            counter: 0,
+            blk_frames: 0,
+            frame_size: DS2_QP_FRAME_SIZE,
+            resync_drop: false,
+            cut: false,
+        }
+    }
+
+    fn frame_qp7(&self) -> bool {
+        if self.mixed {
+            self.frame_format == 7
+        } else {
+            self.qp7
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> usize {
         let start = self.pos.min(self.data.len());
         let got = buf.len().min(self.data.len() - start);
@@ -195,7 +306,8 @@ impl QpFrameReader<'_> {
         if self.read(&mut hdr) != DS2_BLOCK_HEADER_SIZE {
             return false;
         }
-        let frame_count = block_frames(&hdr);
+        self.block_format = block_format(&mut self.last_format, &hdr);
+        let frame_count = qp_block_frames(&hdr, self.block_format, self.mixed);
         let anchor = block_anchor(&hdr);
         self.blk_frames = frame_count as isize;
 
@@ -247,7 +359,10 @@ impl QpFrameReader<'_> {
                 }
             }
 
-            if self.qp7 && offset == 0 {
+            if offset == 0 {
+                self.frame_format = self.block_format;
+            }
+            if self.frame_qp7() && offset == 0 {
                 to_read = to_read.min(DS2_QP7_TYPE_BYTES);
             }
             let got = self.read(&mut frame[offset..offset + to_read]);
@@ -262,7 +377,7 @@ impl QpFrameReader<'_> {
 
             if offset == 0 {
                 self.blk_frames -= 1;
-                if self.qp7 && frame[1] & 0x80 == 0 {
+                if self.frame_qp7() && frame[1] & 0x80 == 0 {
                     self.frame_size = DS2_QP7_PACKET_SHORT_SIZE;
                 }
             }
@@ -281,21 +396,20 @@ impl QpFrameReader<'_> {
 }
 
 fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> (Vec<Vec<u8>>, bool) {
-    let mut reader = QpFrameReader {
-        data,
-        pos: header_size,
-        qp7,
-        total_frames: count_qp_frames(data, header_size, qp7),
-        frames_read: 0,
-        counter: 0,
-        blk_frames: 0,
-        frame_size: DS2_QP_FRAME_SIZE,
-        resync_drop: false,
-        cut: false,
-    };
+    let mut reader = QpFrameReader::new(data, header_size, qp7, false);
     let mut frames = Vec::new();
     while let Some(frame) = reader.read_frame() {
         frames.push(frame);
+    }
+    (frames, reader.cut)
+}
+
+pub(crate) fn mixed_qp_frames(data: &[u8], header_size: usize) -> (TaggedFrames, bool) {
+    let mut reader = QpFrameReader::new(data, header_size, false, true);
+    let mut frames = Vec::new();
+    while let Some(frame) = reader.read_frame() {
+        let tag = if reader.frame_qp7() { 7 } else { 6 };
+        frames.push((tag, frame));
     }
     (frames, reader.cut)
 }
@@ -308,12 +422,26 @@ pub(crate) fn qp_frame_in_progress(data: &[u8]) -> bool {
     if tail == 0 {
         return false;
     }
+    let mixed = ds2_layout(data, header_size) == Ds2Layout::MixedQp;
     let qp7 = detect_ds2_format_type(data, header_size) == 7;
     let last = &data[data.len() - tail..];
-    if last.len() >= DS2_BLOCK_HEADER_SIZE && block_frames(last) > block_frames_held(last, qp7).0 {
+    let mut last_format = known_ds2_format_type(data, header_size);
+    let mut format = 0;
+    let mut pos = header_size;
+    while pos + DS2_BLOCK_HEADER_SIZE <= data.len() {
+        format = block_format(&mut last_format, &data[pos..pos + DS2_BLOCK_HEADER_SIZE]);
+        pos += DS2_BLOCK_SIZE;
+    }
+    if last.len() >= DS2_BLOCK_HEADER_SIZE
+        && qp_block_frames(last, format, mixed) > block_frames_held(last, format, qp7, mixed).0
+    {
         return true;
     }
-    qp_frames(data, header_size, qp7).1
+    if mixed {
+        mixed_qp_frames(data, header_size).1
+    } else {
+        qp_frames(data, header_size, qp7).1
+    }
 }
 
 pub enum DemuxedDs2 {
@@ -391,6 +519,7 @@ mod tests {
 
         let mut block = [0u8; DS2_BLOCK_SIZE];
         block[2] = frame_count;
+        block[3] = 0xff;
         block[4] = mode;
         for (i, byte) in block[DS2_BLOCK_HEADER_SIZE..].iter_mut().enumerate() {
             *byte = payload_pattern.wrapping_add(i as u8);
@@ -569,6 +698,7 @@ mod tests {
         let mut block = vec![0u8; DS2_BLOCK_SIZE];
         block[1] = b1;
         block[2] = b2;
+        block[3] = 0xff;
         block[4] = mode;
         block[5] = b5;
         block[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_HEADER_SIZE + payload.len()].copy_from_slice(payload);

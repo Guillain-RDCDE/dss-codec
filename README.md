@@ -44,10 +44,17 @@ there 0x00 and 0x01 both mean one block. A DSS file with first byte 0x06
 and codec byte 0 is read as a Grundig file.
 
 DS2 SP files hold the same blocks and frames as DSS SP files and decode
-the same way. In both formats the codec is byte 4 of the first block
-header that has frames. The decoder has no LP codec. LP files, codec
-byte 2, and any codec byte missing from this table fail with
-`UnsupportedCodec`.
+the same way. Byte 4 of each audio block header is the block's format
+when byte 3 is 0xff: 0 SP, 1 variable rate SP, 2 or 4 LP, 6 QP and 7
+QP7. A block with another value there, or whose byte 3 is not 0xff,
+takes the format of the last block before it that has frames, and a
+block before any such block takes the format of the first block with
+frames in a known format. A run of blocks in one format is a part, and
+each part decodes with its own codec at its own rate. The first part
+starts at the first frame the decoder reads, and its format and rate are
+the file's. The decoder has no LP codec. An LP part fails with
+`UnsupportedCodec`, and so does a file in which no block with frames has
+byte 3 set to 0xff and a format byte in this list.
 
 Some files hold a stale copy of their header blocks right after the
 header. A block there that starts with a "dss" or "ds2" header is such a
