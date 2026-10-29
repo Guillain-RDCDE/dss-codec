@@ -1,5 +1,4 @@
 use crate::codec::ds2_qp::Ds2QpDecoder;
-use crate::codec::dss_sp::DssSpDecoder;
 use crate::codec::grundig_sp::GrundigSpDecoder;
 use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
 use crate::demux::ds2::{
@@ -47,7 +46,7 @@ enum ActiveDemuxer {
 }
 
 enum ActiveDecoder {
-    Dss(DssSpDecoder),
+    Dss(GrundigSpDecoder),
     Ds2Qp(Ds2QpDecoder),
     Grundig(GrundigSpDecoder),
 }
@@ -205,7 +204,7 @@ impl StreamingDecoder {
                     audio_start(&self.prebuffer, header_size),
                     variable_rate,
                 )));
-                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
+                self.decoder = Some(ActiveDecoder::Dss(GrundigSpDecoder::with_variable_rate(
                     variable_rate,
                 )));
             }
@@ -215,7 +214,7 @@ impl StreamingDecoder {
                     audio_start(&self.prebuffer, header_size),
                     variable_rate,
                 )));
-                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
+                self.decoder = Some(ActiveDecoder::Dss(GrundigSpDecoder::with_variable_rate(
                     variable_rate,
                 )));
             }
@@ -301,7 +300,7 @@ impl StreamingDecoder {
         match self.decoder.as_mut() {
             Some(ActiveDecoder::Dss(decoder)) => {
                 for frame in frames {
-                    let frame_samples = decoder.decode_frame(&frame);
+                    let frame_samples = decoder.decode_dss_packet(&frame);
                     samples.extend(frame_samples.into_iter().map(|sample| sample as f64));
                 }
             }
@@ -518,7 +517,7 @@ mod tests {
         let (dss_samples, dss_format) = stream_decode(&dss, 100).unwrap();
         assert_eq!(ds2_format, Some(AudioFormat::Ds2Sp));
         assert_eq!(dss_format, Some(AudioFormat::DssSp));
-        assert_eq!(ds2_samples.len(), 3 * 264);
+        assert_eq!(ds2_samples.len(), 3 * 288);
         assert_eq!(ds2_samples, dss_samples);
         assert_eq!(crate::decode_to_buffer(&ds2).unwrap().samples, dss_samples);
     }
@@ -531,7 +530,7 @@ mod tests {
         let (ds2_samples, ds2_format) = stream_decode(&ds2, 1).unwrap();
         assert_eq!(dss_format, Some(AudioFormat::DssSp));
         assert_eq!(ds2_format, Some(AudioFormat::Ds2Sp));
-        assert_eq!(dss_samples.len(), 3 * 264);
+        assert_eq!(dss_samples.len(), 3 * 288);
         assert_eq!(ds2_samples, dss_samples);
         assert_eq!(crate::decode_to_buffer(&dss).unwrap().samples, dss_samples);
         assert_eq!(crate::decode_to_buffer(&ds2).unwrap().samples, dss_samples);
@@ -614,7 +613,7 @@ mod tests {
     #[test]
     fn test_streaming_decoder_reads_any_dss_header_block_count() {
         let (expected, _) = stream_decode(&sp_file(b"\x02dss", 0x400, 0), 100).unwrap();
-        assert_eq!(expected.len(), 3 * 264);
+        assert_eq!(expected.len(), 3 * 288);
         for first_byte in [0u8, 1, 3, 8, 19, 255] {
             let data = dss_with_header_blocks(first_byte, 0);
             for chunk in [7, data.len()] {
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn test_streaming_decoder_reads_variable_rate_sp_after_six_header_blocks() {
         let (expected, _) = stream_decode(&sp_file(b"\x02dss", 0x400, 1), 100).unwrap();
-        assert_eq!(expected.len(), 3 * 264);
+        assert_eq!(expected.len(), 3 * 288);
         let data = dss_with_header_blocks(6, 1);
         for chunk in [7, 100, data.len()] {
             let (samples, format) = stream_decode(&data, chunk).unwrap();
@@ -642,7 +641,7 @@ mod tests {
         }
         let buffer = crate::decode_to_buffer(&data).unwrap();
         assert_eq!(buffer.format, AudioFormat::DssSp);
-        assert_eq!(buffer.native_rate, 11000);
+        assert_eq!(buffer.native_rate, 12000);
         assert_eq!(buffer.samples, expected);
         let mut decoder = StreamingDecoder::new();
         let _ = decoder.push(&data[..6 * 512 + 5]).unwrap();
@@ -653,6 +652,47 @@ mod tests {
         let buffer = crate::decode_to_buffer(&grundig).unwrap();
         assert_eq!(buffer.format, AudioFormat::GrundigSp);
         assert_eq!(buffer.native_rate, 12000);
+    }
+
+    #[test]
+    fn test_streaming_decoder_fixed_rate_sp_decodes_like_grundig() {
+        let dss = sp_file(b"\x02dss", 0x400, 0);
+        let grundig = dss_with_header_blocks(6, 0);
+        let (dss_samples, dss_format) = stream_decode(&dss, 100).unwrap();
+        let (grundig_samples, grundig_format) = stream_decode(&grundig, 100).unwrap();
+        assert_eq!(dss_format, Some(AudioFormat::DssSp));
+        assert_eq!(grundig_format, Some(AudioFormat::GrundigSp));
+        assert_eq!(dss_samples.len(), 3 * 288);
+        assert!(dss_samples.iter().any(|&sample| sample != 0.0));
+        assert_eq!(dss_samples, grundig_samples);
+        assert_eq!(crate::decode_to_buffer(&dss).unwrap().samples, grundig_samples);
+    }
+
+    fn assert_decodes_to_zeros(data: &[u8]) {
+        for chunk in [7, 100, data.len()] {
+            let (samples, _) = stream_decode(data, chunk).unwrap();
+            assert_eq!(samples.len(), 3 * 288);
+            assert!(samples.iter().all(|&sample| sample == 0.0));
+        }
+        let buffer = crate::decode_to_buffer(data).unwrap();
+        assert_eq!(buffer.samples.len(), 3 * 288);
+        assert!(buffer.samples.iter().all(|&sample| sample == 0.0));
+    }
+
+    #[test]
+    fn test_streaming_decoder_zero_sp_payload_decodes_to_zeros() {
+        for codec in [0u8, 1] {
+            for first_byte in [3u8, 8, 19] {
+                let mut data = dss_with_header_blocks(first_byte, codec);
+                let header_size = usize::from(first_byte) * 512;
+                data[0x56..header_size].fill(0xff);
+                data[header_size + 6..].fill(0);
+                assert_decodes_to_zeros(&data);
+            }
+            let mut data = sp_file(b"\x03ds2", 0x600, codec);
+            data[0x600 + 6..].fill(0);
+            assert_decodes_to_zeros(&data);
+        }
     }
 
     fn stale_header_copy(first_byte: u8, codec: u8) -> Vec<u8> {
@@ -759,7 +799,7 @@ mod tests {
         samples.extend(decoder.push(&data[0x400 + 512 + 5..]).unwrap());
         assert_eq!(decoder.format(), Some(AudioFormat::DssSp));
         samples.extend(decoder.finish().unwrap());
-        assert_eq!(samples.len(), 3 * 264);
+        assert_eq!(samples.len(), 3 * 288);
     }
 
     #[test]

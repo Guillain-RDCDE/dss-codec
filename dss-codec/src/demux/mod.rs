@@ -8,10 +8,9 @@ use crate::error::{DecodeError, Result};
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioFormat {
-    /// Pure DSS file (.dss), SP codec: decoded at 12000 Hz, then decimated
-    /// 11:12 to 11000 Hz output
+    /// Pure DSS file (.dss), SP codec, 12000 Hz output
     DssSp,
-    /// DS2 file (.ds2), SP mode (mode byte 0-1): DSS SP blocks, 11000 Hz output
+    /// DS2 file (.ds2), SP mode (mode byte 0-1): DSS SP blocks, 12000 Hz output
     Ds2Sp,
     /// DS2 file (.ds2), QP mode (mode byte 6-7), 16000 Hz
     Ds2Qp,
@@ -25,7 +24,7 @@ pub enum AudioFormat {
 impl AudioFormat {
     pub fn native_sample_rate(&self) -> u32 {
         match self {
-            AudioFormat::DssSp | AudioFormat::Ds2Sp => 11000,
+            AudioFormat::DssSp | AudioFormat::Ds2Sp => 12000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
             AudioFormat::GrundigSp => 12000,
         }
@@ -348,8 +347,8 @@ mod tests {
 
     #[test]
     fn ds2_sp_rate_matches_dss_sp() {
-        assert_eq!(AudioFormat::Ds2Sp.native_sample_rate(), 11000);
-        assert_eq!(AudioFormat::DssSp.native_sample_rate(), 11000);
+        assert_eq!(AudioFormat::Ds2Sp.native_sample_rate(), 12000);
+        assert_eq!(AudioFormat::DssSp.native_sample_rate(), 12000);
     }
 
     #[test]

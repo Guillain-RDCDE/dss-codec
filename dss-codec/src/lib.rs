@@ -122,10 +122,11 @@ pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> R
     if detect_format(data) == Some(AudioFormat::DssSp) {
         let (packets, _total) = crate::demux::dss::demux_dss(data)?;
         let variable_rate = crate::demux::sp_codec(data) == Some(1);
-        let mut decoder = crate::codec::dss_sp::DssSpDecoder::with_variable_rate(variable_rate);
+        let mut decoder =
+            crate::codec::grundig_sp::GrundigSpDecoder::with_variable_rate(variable_rate);
         let mut samples = Vec::new();
         for pkt in &packets {
-            for s in decoder.decode_frame(pkt) {
+            for s in decoder.decode_dss_packet(pkt) {
                 samples.push(s as f64);
             }
         }
