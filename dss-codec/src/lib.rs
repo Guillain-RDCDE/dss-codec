@@ -10,7 +10,7 @@ pub mod tables;
 use crate::crypto::ds2_encrypted::ENCRYPTED_MAGIC;
 use crate::demux::{detect_format, AudioFormat};
 use crate::error::{DecodeError, Result};
-use crate::output::resample::{resample, resample_aligned};
+use crate::output::resample::resample;
 use crate::output::wav::write_wav;
 use crate::output::OutputConfig;
 use crate::streaming::{DecryptStreamer, DecryptingDecoderStreamer};
@@ -179,7 +179,7 @@ pub fn decode_and_write_with_password(
             let part_samples = if part.rate == target_rate {
                 part_samples.to_vec()
             } else {
-                resample_aligned(part_samples, part.rate, target_rate)?
+                resample(part_samples, part.rate, target_rate)?
             };
             part.start = samples.len();
             part.len = part_samples.len();

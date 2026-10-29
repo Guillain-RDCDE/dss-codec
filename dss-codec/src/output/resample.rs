@@ -1,6 +1,8 @@
 use crate::error::{DecodeError, Result};
 
-/// Resample mono f64 audio from one sample rate to another using rubato.
+/// Resample mono f64 audio from one sample rate to another using rubato,
+/// without the resampler's delay: output sample n is the input at time
+/// n / to_rate.
 pub fn resample(
     samples: &[f64],
     from_rate: u32,
@@ -20,14 +22,27 @@ pub fn resample(
         1, // mono
     )
     .map_err(|e| DecodeError::Resample(e.to_string()))?;
+    if !resampler.output_frames_next().is_multiple_of(2) {
+        resampler = FftFixedInOut::<f64>::new(
+            from_rate as usize,
+            to_rate as usize,
+            2 * resampler.input_frames_next(),
+            1,
+        )
+        .map_err(|e| DecodeError::Resample(e.to_string()))?;
+    }
+    let delay = resampler.output_delay();
+    let expected_len =
+        (samples.len() as f64 * to_rate as f64 / from_rate as f64).round() as usize;
 
     let mut output = Vec::new();
     let input_frames_needed = resampler.input_frames_next();
     let mut pos = 0;
 
-    while pos < samples.len() {
+    while output.len() < delay + expected_len {
+        let start = pos.min(samples.len());
         let end = (pos + input_frames_needed).min(samples.len());
-        let mut chunk: Vec<f64> = samples[pos..end].to_vec();
+        let mut chunk: Vec<f64> = samples[start..end].to_vec();
 
         // Pad with zeros if needed
         chunk.resize(input_frames_needed, 0.0);
@@ -44,47 +59,6 @@ pub fn resample(
     }
 
     // Trim to expected length
-    let expected_len =
-        (samples.len() as f64 * to_rate as f64 / from_rate as f64).round() as usize;
-    output.truncate(expected_len);
-
-    Ok(output)
-}
-
-/// Resample like `resample`, without the resampler's delay: output sample
-/// n is the input at time n / to_rate.
-pub(crate) fn resample_aligned(samples: &[f64], from_rate: u32, to_rate: u32) -> Result<Vec<f64>> {
-    if from_rate == to_rate {
-        return Ok(samples.to_vec());
-    }
-
-    use rubato::{FftFixedInOut, Resampler};
-
-    let mut resampler = FftFixedInOut::<f64>::new(from_rate as usize, to_rate as usize, 1024, 1)
-        .map_err(|e| DecodeError::Resample(e.to_string()))?;
-    if !resampler.output_frames_next().is_multiple_of(2) {
-        let chunk_size = 2 * resampler.input_frames_next();
-        resampler = FftFixedInOut::<f64>::new(from_rate as usize, to_rate as usize, chunk_size, 1)
-            .map_err(|e| DecodeError::Resample(e.to_string()))?;
-    }
-    let delay = resampler.output_delay();
-    let expected_len =
-        (samples.len() as f64 * to_rate as f64 / from_rate as f64).round() as usize;
-    let input_frames_needed = resampler.input_frames_next();
-
-    let mut output = Vec::new();
-    let mut pos = 0;
-    while output.len() < delay + expected_len {
-        let start = pos.min(samples.len());
-        let end = (pos + input_frames_needed).min(samples.len());
-        let mut chunk = samples[start..end].to_vec();
-        chunk.resize(input_frames_needed, 0.0);
-        let result = resampler
-            .process(&[chunk], None)
-            .map_err(|e| DecodeError::Resample(e.to_string()))?;
-        output.extend_from_slice(&result[0]);
-        pos += input_frames_needed;
-    }
     output.drain(..delay);
     output.truncate(expected_len);
 
@@ -102,7 +76,7 @@ mod tests {
     }
 
     #[test]
-    fn resample_aligned_has_no_delay() {
+    fn resample_has_no_delay() {
         for (from, to) in [
             (16000, 12000),
             (12000, 16000),
@@ -111,7 +85,7 @@ mod tests {
             (12000, 22050),
             (16000, 44100),
         ] {
-            let out = resample_aligned(&tone(from, 3 * from as usize), from, to).unwrap();
+            let out = resample(&tone(from, 3 * from as usize), from, to).unwrap();
             assert_eq!(out.len(), 3 * to as usize);
             let expected = tone(to, out.len());
             let middle = to as usize..2 * to as usize;
