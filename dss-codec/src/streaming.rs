@@ -536,6 +536,23 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_decoder_cut_qp7_keeps_last_frame() {
+        let mut data = make_ds2_header_only(7);
+        data.truncate(0x600 + 6 + 13);
+        data[0x600 + 1] = 3;
+        data[0x600 + 2] = 2;
+        data[0x600 + 5] = 0xff;
+        for (i, byte) in data[0x600 + 6..].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        data[0x600 + 7] &= 0x7f;
+        let (samples, format) = stream_decode(&data, 1).unwrap();
+        assert_eq!(format, Some(AudioFormat::Ds2Qp7));
+        assert_eq!(samples.len(), 2 * 256);
+        assert_eq!(crate::decode_to_buffer(&data).unwrap().samples, samples);
+    }
+
+    #[test]
     fn test_streaming_decoder_refuses_lp() {
         for (prefix, header_size) in [(b"\x03ds2", 0x600), (b"\x02dss", 0x400)] {
             let data = sp_file(prefix, header_size, 2);
@@ -640,6 +657,38 @@ mod tests {
         assert_eq!(decoder.format(), None);
         let _ = decoder.push(&data[0x600 + 512..0x600 + 512 + 6]).unwrap();
         assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn test_streaming_decoder_pause_block_sets_qp_format() {
+        let mut data = make_ds2_header_only(6);
+        data[0x600 + 1] = 3;
+        data[0x600 + 2] = 0;
+        data[0x600 + 5] = 3;
+        for (i, byte) in data[0x600 + 6..].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let mut counted = data.clone();
+        counted[0x600 + 2] = 3;
+        counted[0x600 + 5] = 0xff;
+
+        let mut decoder = StreamingDecoder::new();
+        let _ = decoder.push(&data[..0x600 + 5]).unwrap();
+        assert_eq!(decoder.format(), None);
+        let _ = decoder.push(&data[0x600 + 5..0x600 + 6]).unwrap();
+        assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
+
+        let (expected, _) = stream_decode(&counted, 1).unwrap();
+        assert_eq!(expected.len(), 3 * 256);
+        for chunk in [1, 7, data.len()] {
+            let (samples, format) = stream_decode(&data, chunk).unwrap();
+            assert_eq!(format, Some(AudioFormat::Ds2Qp));
+            assert_eq!(samples, expected);
+        }
+        let buffer = crate::decode_to_buffer(&data).unwrap();
+        assert_eq!(buffer.format, AudioFormat::Ds2Qp);
+        assert_eq!(buffer.native_rate, 16000);
+        assert_eq!(buffer.samples, expected);
     }
 
     #[test]

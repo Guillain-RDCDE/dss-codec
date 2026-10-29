@@ -1,8 +1,9 @@
 /// DS2 file demuxer.
 ///
 /// SP mode (0-1): DSS SP blocks, read by the DSS SP block walk.
-/// QP mode (6): segmented continuous bitstream.
-/// QP7 mode (7): segmented 12/56-byte byte-aligned records.
+/// QP mode (6): 56-byte frames, read from each block's anchor and across
+/// block boundaries.
+/// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
 use crate::demux::dss::dss_sp_frames;
 use crate::demux::{check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
@@ -11,7 +12,8 @@ const DS2_BLOCK_SIZE: usize = 512;
 pub(crate) const DS2_BLOCK_HEADER_SIZE: usize = 6;
 const DS2_QP_FRAME_SIZE: usize = 56;
 const DS2_QP7_PACKET_SHORT_SIZE: usize = 12;
-const DS2_QP7_PACKET_LONG_SIZE: usize = 56;
+const DS2_QP7_TYPE_BYTES: usize = 2;
+const DS2_BLOCK_PAYLOAD_SIZE: usize = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ds2QpSegment {
@@ -30,7 +32,7 @@ pub struct Ds2Qp7Segment {
 pub(crate) fn find_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
     let mut bstart = header_size;
     while bstart + DS2_BLOCK_HEADER_SIZE <= data.len() {
-        if data[bstart + 2] > 0 {
+        if block_frames(&data[bstart..bstart + DS2_BLOCK_HEADER_SIZE]) > 0 {
             return Some(data[bstart + 4]);
         }
         bstart += DS2_BLOCK_SIZE;
@@ -45,152 +47,43 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// Demux a DS2 file.
 /// Returns (frame_data, total_frames, is_qp).
 /// For SP: frame_data is a Vec<Vec<u8>> of packets.
-/// For QP/QP7: frame data is segmented to preserve state resets at cut points.
+/// For QP/QP7: one segment holding every frame in file order.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
     let header_size = ds2_header_size(data)
         .ok_or_else(|| DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")))?;
-    let num_blocks = data.len().saturating_sub(header_size) / DS2_BLOCK_SIZE;
     let format_type = detect_ds2_format_type(data, header_size);
 
-    let mut total_frames: usize = 0;
-    for bi in 0..num_blocks {
-        total_frames += data[header_size + bi * DS2_BLOCK_SIZE + 2] as usize;
-    }
-
     if format_type == 7 {
-        let payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE;
-        let mut raw = Vec::with_capacity(num_blocks * payload_size);
-        for bi in 0..num_blocks {
-            let bstart = header_size + bi * DS2_BLOCK_SIZE;
-            raw.extend_from_slice(&data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE]);
-        }
-
-        let read_record = |raw: &[u8], pos: usize| -> Result<(Vec<u8>, usize)> {
-            if pos + 2 > raw.len() {
-                return Err(DecodeError::Truncated(format!(
-                    "incomplete format-7 selector at byte {}",
-                    pos
-                )));
-            }
-            let size = if (raw[pos + 1] & 0x80) == 0 {
-                DS2_QP7_PACKET_SHORT_SIZE
-            } else {
-                DS2_QP7_PACKET_LONG_SIZE
-            };
-            if pos + size > raw.len() {
-                return Err(DecodeError::Truncated(format!(
-                    "incomplete format-7 record at byte {}",
-                    pos
-                )));
-            }
-            Ok((raw[pos..pos + size].to_vec(), pos + size))
+        let records = qp_frames(data, header_size, true);
+        let total_frames = records.len();
+        let segments = if records.is_empty() {
+            Vec::new()
+        } else {
+            vec![Ds2Qp7Segment {
+                records,
+                total_frames,
+                reset_before: false,
+            }]
         };
-
-        let mut segments = Vec::new();
-        let mut seg_records: Vec<Vec<u8>> = Vec::new();
-        let mut raw_read_pos: Option<usize> = None;
-
-        for bi in 0..num_blocks {
-            let bstart = header_size + bi * DS2_BLOCK_SIZE;
-            let block_header = &data[bstart..bstart + DS2_BLOCK_HEADER_SIZE];
-            let fc = block_header[2] as usize;
-
-            if fc == 0 {
-                if !seg_records.is_empty() {
-                    segments.push(Ds2Qp7Segment {
-                        records: std::mem::take(&mut seg_records),
-                        total_frames: segments.last().map_or(0, |_| 0),
-                        reset_before: !segments.is_empty(),
-                    });
-                    if let Some(last) = segments.last_mut() {
-                        last.total_frames = last.records.len();
-                    }
-                }
-                let zero_end = (bi + 1) * payload_size;
-                raw_read_pos = Some(raw_read_pos.unwrap_or(0).max(zero_end));
-                continue;
-            }
-
-            let payload_off = (block_header[1] as usize * 2).saturating_sub(DS2_BLOCK_HEADER_SIZE);
-            let frames_raw_start = bi * payload_size + payload_off;
-            raw_read_pos = Some(raw_read_pos.unwrap_or(0).max(frames_raw_start));
-
-            for _ in 0..fc {
-                let (record, next_pos) = read_record(&raw, raw_read_pos.unwrap_or(0))?;
-                seg_records.push(record);
-                raw_read_pos = Some(next_pos);
-            }
-        }
-
-        if !seg_records.is_empty() {
-            segments.push(Ds2Qp7Segment {
-                total_frames: seg_records.len(),
-                records: seg_records,
-                reset_before: !segments.is_empty(),
-            });
-        }
-
         Ok(DemuxedDs2::Qp7Segments {
-            total_frames: segments.iter().map(|seg| seg.total_frames).sum(),
             segments,
-        })
-    } else if format_type >= 6 {
-        let payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE;
-        let mut raw = Vec::with_capacity(num_blocks * payload_size);
-        for bi in 0..num_blocks {
-            let bstart = header_size + bi * DS2_BLOCK_SIZE;
-            raw.extend_from_slice(&data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE]);
-        }
-
-        let mut segments = Vec::new();
-        let mut seg_raw_start = 0usize;
-        let mut seg_frames = 0usize;
-        let mut raw_read_pos = 0usize;
-        let mut first_seg = true;
-
-        for bi in 0..num_blocks {
-            let bstart = header_size + bi * DS2_BLOCK_SIZE;
-            let b1 = data[bstart + 1] as usize;
-            let fc = data[bstart + 2] as usize;
-            let payload_off = (b1 * 2).saturating_sub(DS2_BLOCK_HEADER_SIZE);
-            let frames_raw_start = bi * payload_size + payload_off;
-
-            if bi == 0 {
-                raw_read_pos = frames_raw_start;
-                seg_raw_start = frames_raw_start;
-            } else if frames_raw_start != raw_read_pos {
-                let end = raw_read_pos.min(raw.len());
-                if seg_frames > 0 && end > seg_raw_start {
-                    segments.push(Ds2QpSegment {
-                        stream: raw[seg_raw_start..end].to_vec(),
-                        total_frames: seg_frames,
-                        reset_before: !first_seg,
-                    });
-                    first_seg = false;
-                }
-                seg_raw_start = frames_raw_start;
-                seg_frames = 0;
-                raw_read_pos = frames_raw_start;
-            }
-
-            if fc > 0 {
-                seg_frames += fc;
-                raw_read_pos += fc * DS2_QP_FRAME_SIZE;
-            }
-        }
-
-        let end = raw_read_pos.min(raw.len());
-        if seg_frames > 0 && end > seg_raw_start {
-            segments.push(Ds2QpSegment {
-                stream: raw[seg_raw_start..end].to_vec(),
-                total_frames: seg_frames,
-                reset_before: !first_seg,
-            });
-        }
-
-        Ok(DemuxedDs2::QpSegments {
             total_frames,
+        })
+    } else if format_type == 6 {
+        let frames = qp_frames(data, header_size, false);
+        let total_frames = frames.len();
+        let segments = if frames.is_empty() {
+            Vec::new()
+        } else {
+            vec![Ds2QpSegment {
+                stream: frames.concat(),
+                total_frames,
+                reset_before: false,
+            }]
+        };
+        Ok(DemuxedDs2::QpSegments {
             segments,
+            total_frames,
         })
     } else {
         check_sp_codec(format_type)?;
@@ -200,6 +93,215 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             packets,
         })
     }
+}
+
+fn block_frames(hdr: &[u8]) -> usize {
+    if hdr[2] != 0 || hdr[5] == 0xff {
+        hdr[2] as usize
+    } else {
+        hdr[5] as usize
+    }
+}
+
+fn block_anchor(hdr: &[u8]) -> usize {
+    (2 * hdr[1] as usize + 2 * (hdr[0] >> 7) as usize)
+        .saturating_sub(DS2_BLOCK_HEADER_SIZE)
+        .min(DS2_BLOCK_PAYLOAD_SIZE)
+}
+
+fn block_frames_held(block: &[u8], qp7: bool) -> (usize, usize) {
+    let size = block.len();
+    let frame_count = block_frames(block);
+    let mut n = 0;
+    let mut off = DS2_BLOCK_HEADER_SIZE + block_anchor(block);
+    while n < frame_count && off < size {
+        n += 1;
+        if qp7 && off + 1 < size && block[off + 1] & 0x80 == 0 {
+            off += DS2_QP7_PACKET_SHORT_SIZE;
+        } else {
+            off += DS2_QP_FRAME_SIZE;
+        }
+    }
+    let need = if size == DS2_BLOCK_SIZE {
+        off.saturating_sub(DS2_BLOCK_SIZE)
+    } else {
+        0
+    };
+    (n, need)
+}
+
+fn frame_dropped(data: &[u8], mut pos: usize, mut need: usize) -> bool {
+    while need > 0 {
+        pos += DS2_BLOCK_SIZE;
+        let hdr = match data.get(pos..pos + DS2_BLOCK_HEADER_SIZE) {
+            Some(hdr) => hdr,
+            None => return false,
+        };
+        if block_frames(hdr) != 0 {
+            return block_anchor(hdr) != need;
+        }
+        need = need.saturating_sub(block_anchor(hdr));
+    }
+    false
+}
+
+fn count_qp_frames(data: &[u8], header_size: usize, qp7: bool) -> usize {
+    let mut total = 0;
+    let mut pos = header_size;
+    while pos + DS2_BLOCK_HEADER_SIZE <= data.len() {
+        let block = &data[pos..data.len().min(pos + DS2_BLOCK_SIZE)];
+        let (n, need) = block_frames_held(block, qp7);
+        total += if need > 0 && frame_dropped(data, pos, need) {
+            n - 1
+        } else {
+            n
+        };
+        pos += DS2_BLOCK_SIZE;
+    }
+    total
+}
+
+struct QpFrameReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+    qp7: bool,
+    total_frames: usize,
+    frames_read: usize,
+    counter: usize,
+    blk_frames: isize,
+    frame_size: usize,
+    resync_drop: bool,
+}
+
+impl QpFrameReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> usize {
+        let start = self.pos.min(self.data.len());
+        let got = buf.len().min(self.data.len() - start);
+        buf[..got].copy_from_slice(&self.data[start..start + got]);
+        self.pos += got;
+        got
+    }
+
+    fn all_read(&self) -> bool {
+        self.total_frames > 0 && self.frames_read >= self.total_frames
+    }
+
+    fn next_block(&mut self, in_frame_offset: usize) -> bool {
+        let in_block = self.pos % DS2_BLOCK_SIZE;
+        self.counter = 0;
+        self.resync_drop = false;
+        if in_block > 0 {
+            self.pos += DS2_BLOCK_SIZE - in_block;
+        }
+        if self.all_read() {
+            return false;
+        }
+
+        let mut hdr = [0u8; DS2_BLOCK_HEADER_SIZE];
+        if self.read(&mut hdr) != DS2_BLOCK_HEADER_SIZE {
+            return false;
+        }
+        let frame_count = block_frames(&hdr);
+        let anchor = block_anchor(&hdr);
+        self.blk_frames = frame_count as isize;
+
+        if frame_count == 0 {
+            self.counter = anchor;
+            return true;
+        }
+        let aligned = (in_frame_offset == 0 && anchor == 0)
+            || (in_frame_offset != 0 && in_frame_offset + anchor == self.frame_size);
+        if aligned {
+            self.counter = DS2_BLOCK_PAYLOAD_SIZE;
+        } else {
+            self.resync_drop = true;
+            self.pos += anchor;
+            self.counter = DS2_BLOCK_PAYLOAD_SIZE - anchor;
+        }
+        true
+    }
+
+    fn read_frame(&mut self) -> Option<Vec<u8>> {
+        if self.all_read() {
+            return None;
+        }
+        while self.blk_frames <= 0 || self.counter == 0 {
+            if !self.next_block(0) {
+                return None;
+            }
+        }
+
+        let mut frame = [0u8; DS2_QP_FRAME_SIZE];
+        let mut offset = 0;
+        self.frame_size = DS2_QP_FRAME_SIZE;
+        while offset < self.frame_size {
+            let mut to_read = (self.frame_size - offset).min(self.counter);
+            if to_read == 0 {
+                if !self.next_block(offset) {
+                    if offset > 0 && !self.resync_drop {
+                        break;
+                    }
+                    return None;
+                }
+                if self.resync_drop {
+                    offset = 0;
+                    self.frame_size = DS2_QP_FRAME_SIZE;
+                }
+                to_read = (self.frame_size - offset).min(self.counter);
+                if to_read == 0 {
+                    continue;
+                }
+            }
+
+            if self.qp7 && offset == 0 {
+                to_read = to_read.min(DS2_QP7_TYPE_BYTES);
+            }
+            let got = self.read(&mut frame[offset..offset + to_read]);
+            if got < to_read {
+                offset += got;
+                if offset == 0 {
+                    return None;
+                }
+                self.counter = 0;
+                break;
+            }
+
+            if offset == 0 {
+                self.blk_frames -= 1;
+                if self.qp7 && frame[1] & 0x80 == 0 {
+                    self.frame_size = DS2_QP7_PACKET_SHORT_SIZE;
+                }
+            }
+            offset += to_read;
+            self.counter -= to_read;
+        }
+
+        if offset < self.frame_size {
+            frame[offset..self.frame_size].fill(0);
+            self.counter = 0;
+        }
+        self.frames_read += 1;
+        Some(frame[..self.frame_size].to_vec())
+    }
+}
+
+fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> Vec<Vec<u8>> {
+    let mut reader = QpFrameReader {
+        data,
+        pos: header_size,
+        qp7,
+        total_frames: count_qp_frames(data, header_size, qp7),
+        frames_read: 0,
+        counter: 0,
+        blk_frames: 0,
+        frame_size: DS2_QP_FRAME_SIZE,
+        resync_drop: false,
+    };
+    let mut frames = Vec::new();
+    while let Some(frame) = reader.read_frame() {
+        frames.push(frame);
+    }
+    frames
 }
 
 pub enum DemuxedDs2 {
@@ -377,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_ds2_demux_refuses_lp_and_unknown_codecs() {
-        for mode in [2u8, 3, 4, 5] {
+        for mode in [2u8, 3, 4, 5, 8, 255] {
             let data = make_ds2_file(mode, 4, 0x10);
             assert!(matches!(
                 demux_ds2(&data),
@@ -449,6 +551,212 @@ mod tests {
             _ => panic!("expected DS2 QP stream"),
         };
         assert_eq!(frames(demux_ds2(&data).unwrap()), frames(demux_ds2(&long).unwrap()));
+    }
+
+    fn qp_block(b1: u8, b2: u8, b5: u8, mode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; DS2_BLOCK_SIZE];
+        block[1] = b1;
+        block[2] = b2;
+        block[4] = mode;
+        block[5] = b5;
+        block[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_HEADER_SIZE + payload.len()].copy_from_slice(payload);
+        block
+    }
+
+    fn qp_file(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = vec![0u8; 3 * DS2_BLOCK_SIZE];
+        data[0] = 3;
+        data[1..4].copy_from_slice(b"ds2");
+        for block in blocks {
+            data.extend_from_slice(block);
+        }
+        data
+    }
+
+    fn stream_bytes(start: usize, len: usize) -> Vec<u8> {
+        (start..start + len).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    fn anchor_byte(anchor: usize) -> u8 {
+        ((anchor + DS2_BLOCK_HEADER_SIZE) / 2) as u8
+    }
+
+    fn qp_frames_of(data: &[u8]) -> Vec<Vec<u8>> {
+        match demux_ds2(data).unwrap() {
+            DemuxedDs2::QpSegments {
+                segments,
+                total_frames,
+            } => {
+                assert!(segments.iter().all(|seg| !seg.reset_before));
+                let frames: Vec<Vec<u8>> = segments
+                    .iter()
+                    .flat_map(|seg| seg.stream.chunks(DS2_QP_FRAME_SIZE).map(|c| c.to_vec()))
+                    .collect();
+                assert_eq!(frames.len(), total_frames);
+                frames
+            }
+            DemuxedDs2::Qp7Segments {
+                segments,
+                total_frames,
+            } => {
+                assert!(segments.iter().all(|seg| !seg.reset_before));
+                let frames: Vec<Vec<u8>> =
+                    segments.into_iter().flat_map(|seg| seg.records).collect();
+                assert_eq!(frames.len(), total_frames);
+                frames
+            }
+            _ => panic!("expected DS2 QP frames"),
+        }
+    }
+
+    fn stream_frames(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|k| stream_bytes(k * DS2_QP_FRAME_SIZE, DS2_QP_FRAME_SIZE))
+            .collect()
+    }
+
+    fn zero_filled(start: usize, len: usize) -> Vec<u8> {
+        let mut frame = stream_bytes(start, len);
+        frame.resize(DS2_QP_FRAME_SIZE, 0);
+        frame
+    }
+
+    #[test]
+    fn test_ds2_qp_frames_continue_across_blocks() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 8, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        assert_eq!(qp_frames_of(&data), stream_frames(18));
+    }
+
+    #[test]
+    fn test_ds2_qp_pause_block_frames_from_byte5() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 0, 3, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(0), 0, 0xff, 6, &stream_bytes(1000, 506)),
+            qp_block(anchor_byte(0), 1, 0xff, 6, &stream_bytes(168, 506)),
+        ]);
+        assert_eq!(qp_frames_of(&data), stream_frames(4));
+    }
+
+    #[test]
+    fn test_ds2_qp_pause_block_sets_format() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 0, 0xff, 7, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(0), 0, 3, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(0), 1, 0xff, 7, &stream_bytes(1000, 506)),
+        ]);
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(6));
+        assert_eq!(detect_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), 6);
+
+        let pause = qp_file(&[qp_block(anchor_byte(0), 0, 3, 6, &stream_bytes(0, 506))]);
+        let mut counted = pause.clone();
+        counted[3 * DS2_BLOCK_SIZE + 2] = 3;
+        counted[3 * DS2_BLOCK_SIZE + 5] = 0xff;
+        assert_eq!(find_ds2_format_type(&pause, 3 * DS2_BLOCK_SIZE), Some(6));
+        assert_eq!(qp_frames_of(&pause), stream_frames(3));
+        assert_eq!(qp_frames_of(&pause), qp_frames_of(&counted));
+    }
+
+    #[test]
+    fn test_ds2_qp_overstated_count_stops_at_block_end() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 19, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 1, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        assert_eq!(qp_frames_of(&data), stream_frames(11));
+    }
+
+    #[test]
+    fn test_ds2_qp_empty_block_carries_frame_tail() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(30), 0, 0xff, 6, &stream_bytes(506, 506)),
+            qp_block(anchor_byte(24), 1, 0xff, 6, &stream_bytes(536, 506)),
+        ]);
+        assert_eq!(qp_frames_of(&data), stream_frames(11));
+    }
+
+    #[test]
+    fn test_ds2_qp7_type_bit_sizes_frames() {
+        let mut payload = stream_bytes(0, 506);
+        payload[1] &= 0x7f;
+        payload[13] |= 0x80;
+        payload[69] &= 0x7f;
+        payload[81] |= 0x80;
+        let data = qp_file(&[qp_block(anchor_byte(0), 4, 0xff, 7, &payload)]);
+        assert_eq!(
+            qp_frames_of(&data),
+            vec![
+                payload[..12].to_vec(),
+                payload[12..68].to_vec(),
+                payload[68..80].to_vec(),
+                payload[80..136].to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ds2_qp_file_ending_inside_frame_zero_fills_it() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 9, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        let mut expected = stream_frames(18);
+        expected.push(zero_filled(18 * DS2_QP_FRAME_SIZE, 4));
+        assert_eq!(qp_frames_of(&data), expected);
+    }
+
+    #[test]
+    fn test_ds2_qp_cut_block_counts_frames_that_start_in_it() {
+        let data = qp_file(&[qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506))]);
+        let cut = &data[..3 * DS2_BLOCK_SIZE + 300];
+        let mut expected = stream_frames(5);
+        expected.push(zero_filled(5 * DS2_QP_FRAME_SIZE, 14));
+        assert_eq!(qp_frames_of(cut), expected);
+    }
+
+    #[test]
+    fn test_ds2_qp_resync_block_drops_partial_frame() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(100), 7, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        let mut expected = stream_frames(9);
+        expected.extend((0..7).map(|k| stream_bytes(606 + k * DS2_QP_FRAME_SIZE, DS2_QP_FRAME_SIZE)));
+        assert_eq!(qp_frames_of(&data), expected);
+    }
+
+    #[test]
+    fn test_ds2_qp_empty_block_with_wrong_anchor_drops_frame() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(30), 0, 0xff, 6, &stream_bytes(506, 506)),
+            qp_block(anchor_byte(30), 1, 0xff, 6, &stream_bytes(536, 506)),
+        ]);
+        let mut expected = stream_frames(9);
+        expected.push(stream_bytes(566, DS2_QP_FRAME_SIZE));
+        assert_eq!(qp_frames_of(&data), expected);
+    }
+
+    #[test]
+    fn test_ds2_qp7_cut_inside_type_bytes_keeps_zeroed_frame() {
+        let mut payload = stream_bytes(0, 506);
+        payload[1] &= 0x7f;
+        payload[13] |= 0x80;
+        let data = qp_file(&[qp_block(anchor_byte(0), 2, 0xff, 7, &payload)]);
+        let cut = &data[..3 * DS2_BLOCK_SIZE + DS2_BLOCK_HEADER_SIZE + 13];
+        let mut second = vec![0u8; DS2_QP_FRAME_SIZE];
+        second[0] = payload[12];
+        assert_eq!(qp_frames_of(cut), vec![payload[..12].to_vec(), second]);
+    }
+
+    #[test]
+    fn test_ds2_qp_stops_at_counted_frames_and_partial_header() {
+        let mut data = qp_file(&[qp_block(anchor_byte(0), 3, 0xff, 6, &stream_bytes(0, 506))]);
+        data.extend_from_slice(&[0, anchor_byte(0), 5, 0]);
+        assert_eq!(qp_frames_of(&data), stream_frames(3));
     }
 
     #[test]
