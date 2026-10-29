@@ -34,7 +34,7 @@ DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
 |-----------|-------|-------------|-----------|
 | `.dss` (v2/v3) | DSS SP | 12000 Hz | Header `{00..ff}dss`, byte4 is 0 or 1 |
 | `.ds2` mode 0-1 | DSS SP | 12000 Hz | Header `{01..ff}ds2`, byte4 is 0 or 1 |
-| `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `{01..ff}ds2`, byte4 >= 6 |
+| `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `{01..ff}ds2`, byte4 is 6 or 7 |
 
 The first byte of a DS2 file, 0x01 to 0xff, is its header length in
 512-byte blocks. 0x01 means one block when byte 3 of the block at 0x200
