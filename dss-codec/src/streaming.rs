@@ -745,6 +745,45 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_decoder_grundig_strict_finish_reports_cut() {
+        let mut whole = vec![0u8; 6 * 512];
+        whole[..4].copy_from_slice(b"\x06dss");
+        let mut block = vec![0u8; 512];
+        block[..6].copy_from_slice(&[0x00, 3, 2, 0xff, 0x00, 0xff]);
+        for (i, byte) in block[6..].iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        whole.extend_from_slice(&block);
+
+        let (samples, format) = stream_decode(&whole, 37).unwrap();
+        assert_eq!(format, Some(AudioFormat::GrundigSp));
+        assert!(!samples.is_empty());
+        assert_eq!(crate::decode_to_buffer(&whole).unwrap().samples, samples);
+
+        let data = &whole[..6 * 512 + 6 + 70];
+        let err = stream_decode(data, 37).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated(_)));
+
+        let mut decoder = StreamingDecoder::new();
+        let mut lenient = Vec::new();
+        for part in data.chunks(37) {
+            lenient.extend(decoder.push(part).unwrap());
+        }
+        lenient.extend(decoder.finish_lenient().unwrap());
+        assert_eq!(decoder.format(), Some(AudioFormat::GrundigSp));
+        assert!(!lenient.is_empty());
+        assert_eq!(crate::decode_to_buffer(data).unwrap().samples, lenient);
+
+        let data = &whole[..1000];
+        let err = stream_decode(data, 37).unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated(what) if what == "Grundig header"));
+        assert!(matches!(
+            crate::decode_to_buffer(data),
+            Err(DecodeError::Truncated(what)) if what == "Grundig header"
+        ));
+    }
+
+    #[test]
     fn test_streaming_decoder_detects_only_when_enough_bytes_arrive() {
         let data = make_ds2_header_only(6);
         let mut decoder = StreamingDecoder::new();
