@@ -67,7 +67,7 @@ fn main() {
         bit_depth: cli.bits,
         channels: cli.channels,
     };
-    let password = resolve_password(cli.password.as_deref());
+    let password = resolve_password(cli.password.as_deref(), env::var("DSS_CODEC_PASSWORD").ok());
 
     for input_path in &cli.input {
         let output_path = if cli.decrypt {
@@ -148,11 +148,11 @@ fn main() {
     }
 }
 
-fn resolve_password(cli_password: Option<&str>) -> Option<Vec<u8>> {
+fn resolve_password(cli_password: Option<&str>, env_password: Option<String>) -> Option<Vec<u8>> {
     cli_password
         .map(str::as_bytes)
         .map(|bytes| bytes.to_vec())
-        .or_else(|| env::var("DSS_CODEC_PASSWORD").ok().map(|value| value.into_bytes()))
+        .or_else(|| env_password.map(|value| value.into_bytes()))
 }
 
 fn make_output_path(input: &PathBuf, output_dir: Option<&std::path::Path>, ext: &str) -> PathBuf {
@@ -212,29 +212,27 @@ fn print_info(path: &PathBuf, _quiet: bool) {
 #[cfg(test)]
 mod tests {
     use super::{make_decrypt_output_path, resolve_password};
-    use std::env;
     use std::path::PathBuf;
 
     #[test]
     fn resolve_password_prefers_cli_over_env() {
-        unsafe {
-            env::set_var("DSS_CODEC_PASSWORD", "env-secret");
-        }
-        assert_eq!(resolve_password(Some("cli-secret")), Some(b"cli-secret".to_vec()));
-        unsafe {
-            env::remove_var("DSS_CODEC_PASSWORD");
-        }
+        assert_eq!(
+            resolve_password(Some("cli-secret"), Some("env-secret".to_string())),
+            Some(b"cli-secret".to_vec())
+        );
     }
 
     #[test]
     fn resolve_password_falls_back_to_env() {
-        unsafe {
-            env::set_var("DSS_CODEC_PASSWORD", "env-secret");
-        }
-        assert_eq!(resolve_password(None), Some(b"env-secret".to_vec()));
-        unsafe {
-            env::remove_var("DSS_CODEC_PASSWORD");
-        }
+        assert_eq!(
+            resolve_password(None, Some("env-secret".to_string())),
+            Some(b"env-secret".to_vec())
+        );
+    }
+
+    #[test]
+    fn resolve_password_is_none_without_cli_or_env() {
+        assert_eq!(resolve_password(None, None), None);
     }
 
     #[test]
