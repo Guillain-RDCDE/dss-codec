@@ -18,7 +18,7 @@ pub enum AudioFormat {
     /// DS2 file (.ds2), QP7 mode (mode byte 7), 16000 Hz
     Ds2Qp7,
     /// Grundig DSS file (first byte 6, magic "dss", codec byte 0), SP codec at
-    /// 16000 Hz output
+    /// 12000 Hz output
     GrundigSp,
 }
 
@@ -27,7 +27,7 @@ impl AudioFormat {
         match self {
             AudioFormat::DssSp | AudioFormat::Ds2Sp => 11000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
-            AudioFormat::GrundigSp => 16000,
+            AudioFormat::GrundigSp => 12000,
         }
     }
 

@@ -4,10 +4,12 @@
 //! (dss2wav.dll, DigtaSoft One). Decodes the Grundig `\x06dss` variant of the
 //! Digital Speech Standard. The synthesis runs a 14th-order reflection-coefficient
 //! lattice driven by an adaptive (pitch) plus fixed (algebraic) codebook
-//! excitation at 12 kHz (288 samples/frame), then a 3:4 polyphase FIR resampler
-//! lifts it to 16 kHz (384 samples/frame).
+//! excitation at 12 kHz and outputs 288 samples per frame at that rate.
 //!
-//! The output is bit-exact with the reference codec on the Grundig sample set.
+//! dss2wav lifts the 12 kHz signal to 16 kHz with a 3:4 polyphase FIR. That
+//! FIR is a playback step of the reference tool, not part of the codec, so
+//! this decoder stops at 12 kHz. Through that FIR the output is bit-exact
+//! with dss2wav on the Grundig sample set.
 
 use crate::tables::grundig_sp::*;
 
@@ -42,7 +44,6 @@ pub struct GrundigSpDecoder {
     syn: [f64; 16],   // lattice b-state (order 14)
     rnd: u32,         // unvoiced PRNG (16-bit)
     deemph: f64,      // de-emphasis memory
-    pcm12: Vec<f64>,  // 12 kHz PCM accumulated across frames
 }
 
 impl Default for GrundigSpDecoder {
@@ -58,23 +59,13 @@ impl GrundigSpDecoder {
             syn: [0.0; 16],
             rnd: 0,
             deemph: 0.0,
-            pcm12: Vec::new(),
         }
     }
 
-    /// Decode one 41-byte (328-bit) frame. The 12 kHz PCM is buffered; the
-    /// final 16 kHz output is produced by `finish()` (the polyphase resampler
-    /// needs the whole utterance, matching the reference decoder).
+    /// Decode one 41-byte (328-bit) frame into 288 samples at 12 kHz.
     pub fn decode_frame(&mut self, frame: &[u8]) -> Vec<i64> {
         let bits = unpack_bits(frame);
-        let synth = self.decode_frame_pcm12(&bits);
-        self.pcm12.extend(synth.iter().map(|&v| v as f64));
-        Vec::new()
-    }
-
-    /// Resample the accumulated 12 kHz PCM to 16 kHz and return all samples.
-    pub fn finish(&mut self) -> Vec<i64> {
-        resample(&self.pcm12)
+        self.decode_frame_pcm12(&bits)
     }
 
     // -------------------------------------------------- stage 2 (CELP @ 12 kHz)
@@ -246,39 +237,6 @@ impl GrundigSpDecoder {
         self.deemph = prev;
         out
     }
-}
-
-// -------------------------------------------------- stage 3 (3:4 polyphase FIR)
-//
-// 12 kHz -> 16 kHz. 100 taps per phase, plus a single extra tap on phase 0.
-// `HIST` (0xce) zero-history samples precede the first input sample.
-fn resample(inp: &[f64]) -> Vec<i64> {
-    const HIST: usize = 0xce;
-    let mut x = vec![0.0f64; HIST];
-    x.extend_from_slice(inp);
-    let n = x.len();
-    let mut out = Vec::new();
-    let mut uv: i64 = 0;
-    let mut pos: usize = HIST;
-    while pos < n {
-        let mut acc = 0.0f64;
-        let mut c = uv as usize;
-        for k in 0..100 {
-            acc += x[pos - k] * RESAMP[c];
-            c += 4;
-        }
-        if uv == 0 {
-            acc += x[pos - 100] * RESAMP[400];
-        }
-        out.push(round_clamp(acc));
-        uv += 3;
-        if uv > 3 {
-            let adv = uv >> 2;
-            pos += adv as usize;
-            uv -= 4 * adv;
-        }
-    }
-    out
 }
 
 // ------------------------------------------------------------------ bit I/O

@@ -311,14 +311,9 @@ impl StreamingDecoder {
                 }
             }
             Some(ActiveDecoder::Grundig(decoder)) => {
-                // The Grundig demuxer emits every frame at once (at stream
-                // finish). Each frame buffers 12 kHz PCM; finish() runs the
-                // polyphase resampler over the whole utterance -> 16 kHz.
-                if !frames.is_empty() {
-                    for frame in frames {
-                        let _ = decoder.decode_frame(&frame);
-                    }
-                    samples.extend(decoder.finish().into_iter().map(|s| s as f64));
+                for frame in frames {
+                    let frame_samples = decoder.decode_frame(&frame);
+                    samples.extend(frame_samples.into_iter().map(|sample| sample as f64));
                 }
             }
             None => {}
@@ -657,7 +652,7 @@ mod tests {
         assert_eq!(stream_decode(&grundig, 7).unwrap().1, Some(AudioFormat::GrundigSp));
         let buffer = crate::decode_to_buffer(&grundig).unwrap();
         assert_eq!(buffer.format, AudioFormat::GrundigSp);
-        assert_eq!(buffer.native_rate, 16000);
+        assert_eq!(buffer.native_rate, 12000);
     }
 
     fn stale_header_copy(first_byte: u8, codec: u8) -> Vec<u8> {
