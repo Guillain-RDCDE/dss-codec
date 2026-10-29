@@ -14,6 +14,9 @@ pub enum DecodeError {
     #[error("unsupported DS2 format type: {0}")]
     UnsupportedFormat(u8),
 
+    #[error("unsupported audio codec: {0}")]
+    UnsupportedCodec(u8),
+
     #[error("encrypted DS2 error: {0}")]
     EncryptedDs2(String),
 

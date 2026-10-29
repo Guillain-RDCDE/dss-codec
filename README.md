@@ -32,13 +32,19 @@ DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
 
 | File Type | Codec | Native Rate | Detection |
 |-----------|-------|-------------|-----------|
-| `.dss` (v2/v3) | DSS SP | 11025 Hz | Header `{02\|03}dss` |
-| `.ds2` mode 0-1 | DS2 SP | 12000 Hz | Header `{01..ff}ds2`, byte4 < 6 |
+| `.dss` (v2/v3) | DSS SP | 11000 Hz | Header `{02\|03}dss`, byte4 is 0 or 1 |
+| `.ds2` mode 0-1 | DSS SP | 11000 Hz | Header `{01..ff}ds2`, byte4 is 0 or 1 |
 | `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `{01..ff}ds2`, byte4 >= 6 |
 
 The first byte of a DS2 file, 0x01 to 0xff, is its header length in
 512-byte blocks. 0x01 means one block when byte 3 of the block at 0x200
 is 0xff, as in an audio block header. Otherwise 0x01 means three blocks.
+
+DS2 SP files hold the same blocks and frames as DSS SP files and decode
+the same way. In both formats the codec is byte 4 of the first block
+header that has frames. The decoder has no LP codec. LP files, codec
+byte 2, and any codec byte missing from this table fail with
+`UnsupportedCodec`.
 
 Encrypted DS2 files with header `\x03enc` are also supported when a password is provided, and can be either decoded directly or normalized back to a plain `.ds2` container with `--decrypt`.
 

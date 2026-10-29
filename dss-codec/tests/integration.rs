@@ -32,10 +32,10 @@ fn test_decode_ds2_sp_basic() {
         return;
     }
     let buf = dss_codec::decode_file(path).unwrap();
-    assert_eq!(buf.native_rate, 12000);
+    assert_eq!(buf.native_rate, 11000);
     assert!(!buf.samples.is_empty());
-    // SP mode: 288 samples per frame
-    assert_eq!(buf.samples.len() % 288, 0);
+    // SP mode: 264 samples per frame
+    assert_eq!(buf.samples.len() % 264, 0);
 }
 
 #[test]

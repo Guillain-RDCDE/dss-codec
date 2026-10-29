@@ -2,7 +2,8 @@ pub mod dss;
 pub mod ds2;
 pub mod grundig;
 
-use crate::demux::ds2::detect_ds2_format_type;
+use crate::demux::ds2::{detect_ds2_format_type, DS2_BLOCK_HEADER_SIZE};
+use crate::error::{DecodeError, Result};
 
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10,7 +11,7 @@ pub enum AudioFormat {
     /// Pure DSS file (.dss), SP codec: decoded at 12000 Hz, then decimated
     /// 11:12 to 11000 Hz output
     DssSp,
-    /// DS2 file (.ds2), SP mode (mode byte 0-1), 12000 Hz
+    /// DS2 file (.ds2), SP mode (mode byte 0-1): DSS SP blocks, 11000 Hz output
     Ds2Sp,
     /// DS2 file (.ds2), QP mode (mode byte 6-7), 16000 Hz
     Ds2Qp,
@@ -23,8 +24,7 @@ pub enum AudioFormat {
 impl AudioFormat {
     pub fn native_sample_rate(&self) -> u32 {
         match self {
-            AudioFormat::DssSp => 11000,
-            AudioFormat::Ds2Sp => 12000,
+            AudioFormat::DssSp | AudioFormat::Ds2Sp => 11000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
             AudioFormat::GrundigSp => 16000,
         }
@@ -65,7 +65,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
         return Some(AudioFormat::DssSp);
     }
-    if data[..4] == *b"\x03enc" && data.len() > 0x604 {
+    if data[..4] == *b"\x03enc" && data.len() >= 0x600 + DS2_BLOCK_HEADER_SIZE {
         let format_type = data[0x600 + 4];
         return Some(match format_type {
             7 => AudioFormat::Ds2Qp7,
@@ -74,7 +74,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         });
     }
     if let Some(header_size) = ds2_header_size(data) {
-        if data.len() <= header_size + 4 {
+        if data.len() < header_size + DS2_BLOCK_HEADER_SIZE {
             return None;
         }
         let format_type = detect_ds2_format_type(data, header_size);
@@ -95,6 +95,22 @@ pub(crate) fn ds2_header_size(data: &[u8]) -> Option<usize> {
         return Some(3 * 512);
     }
     Some(usize::from(data[0]) * 512)
+}
+
+pub(crate) fn sp_codec(data: &[u8]) -> Option<u8> {
+    let header_size = if data.len() >= 4 && data[1..4] == *b"dss" {
+        data[0] as usize * 512
+    } else {
+        ds2_header_size(data)?
+    };
+    Some(detect_ds2_format_type(data, header_size))
+}
+
+pub(crate) fn check_sp_codec(codec: u8) -> Result<()> {
+    match codec {
+        0 | 1 => Ok(()),
+        other => Err(DecodeError::UnsupportedCodec(other)),
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +211,49 @@ mod tests {
         assert_eq!(detect_format(&data[..8 * 512]), None);
         assert_eq!(detect_format(&data[..3 * 512 + 5]), None);
         assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn detect_format_needs_whole_first_block_header() {
+        let data = make_ds2_with_header_blocks(3, 3, 6);
+        assert_eq!(detect_format(&data[..3 * 512 + 5]), None);
+        assert_eq!(detect_format(&data[..3 * 512 + 6]), Some(AudioFormat::Ds2Qp));
+        let data = make_ds2_like_file(*b"\x03enc", 6);
+        assert_eq!(detect_format(&data[..0x600 + 5]), None);
+        assert_eq!(detect_format(&data[..0x600 + 6]), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn sp_codec_reads_first_block_with_frames() {
+        let mut dss = make_ds2_with_header_blocks(2, 2, 2);
+        dss[1..4].copy_from_slice(b"dss");
+        assert_eq!(sp_codec(&dss), Some(2));
+        dss[0x2a4] = 1;
+        assert_eq!(sp_codec(&dss), Some(2));
+        assert_eq!(sp_codec(&dss[..1024 + 5]), Some(0));
+        dss[1024 + 2] = 0;
+        assert_eq!(sp_codec(&dss), Some(0));
+        assert_eq!(sp_codec(&make_ds2_with_header_blocks(3, 3, 1)), Some(1));
+        assert_eq!(sp_codec(&make_ds2_with_header_blocks(2, 2, 2)), Some(2));
+        assert_eq!(sp_codec(b"RIFF"), None);
+    }
+
+    #[test]
+    fn check_sp_codec_accepts_sp_and_variable_rate_only() {
+        assert!(check_sp_codec(0).is_ok());
+        assert!(check_sp_codec(1).is_ok());
+        for codec in [2u8, 3, 5, 6, 0xff] {
+            assert!(matches!(
+                check_sp_codec(codec),
+                Err(DecodeError::UnsupportedCodec(c)) if c == codec
+            ));
+        }
+    }
+
+    #[test]
+    fn ds2_sp_rate_matches_dss_sp() {
+        assert_eq!(AudioFormat::Ds2Sp.native_sample_rate(), 11000);
+        assert_eq!(AudioFormat::DssSp.native_sample_rate(), 11000);
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     if data.len() < header_size {
         return Err(DecodeError::Truncated("DSS header".to_string()));
     }
+    let codec = crate::demux::ds2::detect_ds2_format_type(data, header_size);
+    crate::demux::check_sp_codec(codec)?;
     let (frames, _cut) = dss_sp_frames(data, header_size);
     let total_frames = frames.len();
     Ok((frames, total_frames))
@@ -556,6 +558,81 @@ mod tests {
             ));
         }
         let (frames, total) = demux_dss(&data).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_dss_demux_refuses_lp_and_unknown_codecs() {
+        for codec in [2u8, 3, 0xff] {
+            let mut block = make_dss_block(0, 3, 3, 0x20);
+            block[4] = codec;
+            assert!(matches!(
+                demux_dss(&make_dss_file(&[block])),
+                Err(DecodeError::UnsupportedCodec(c)) if c == codec
+            ));
+        }
+        let data = make_dss_file(&[make_dss_block(0, 3, 3, 0x20)]);
+        assert_eq!(demux_dss(&data).unwrap().1, 3);
+    }
+
+    #[test]
+    fn test_dss_demux_ignores_header_codec_byte() {
+        let data = make_dss_file(&[make_dss_block(0, 3, 3, 0x20)]);
+        let (expected, _) = demux_dss(&data).unwrap();
+        for byte in [1u8, 2, 0xff] {
+            let mut marked = data.clone();
+            marked[0x2a4] = byte;
+            let (frames, total) = demux_dss(&marked).unwrap();
+            assert_eq!(total, 3);
+            assert_eq!(frames, expected);
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_takes_codec_from_first_block_with_frames() {
+        let mut empty = make_dss_block(0, 3, 0, 0x10);
+        empty[4] = 2;
+        let data = make_dss_file(&[empty, make_dss_block(0, 3, 3, 0x20)]);
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 3);
+        let (expected, _) = demux_dss(&make_dss_file(&[make_dss_block(0, 3, 3, 0x20)])).unwrap();
+        assert_eq!(frames, expected);
+    }
+
+    #[test]
+    fn test_dss_demux_refuses_lp_after_empty_block() {
+        let mut lp = make_dss_block(0, 3, 3, 0x20);
+        lp[4] = 2;
+        let data = make_dss_file(&[make_dss_block(0, 3, 0, 0x10), lp]);
+        assert!(matches!(demux_dss(&data), Err(DecodeError::UnsupportedCodec(2))));
+    }
+
+    #[test]
+    fn test_dss_demux_refuses_lp_in_partial_first_block() {
+        let mut lp = make_dss_block(0, 3, 3, 0x20);
+        lp[4] = 2;
+        let data = make_dss_file(&[lp]);
+        for end in [2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE, 2 * DSS_BLOCK_SIZE + 100] {
+            assert!(matches!(
+                demux_dss(&data[..end]),
+                Err(DecodeError::UnsupportedCodec(2))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_without_frames_is_empty() {
+        let mut empty = make_dss_block(0, 3, 0, 0x10);
+        empty[4] = 2;
+        let (frames, total) = demux_dss(&make_dss_file(&[empty, empty])).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(total, 0);
+
+        let mut lp = make_dss_block(0, 3, 3, 0x20);
+        lp[4] = 2;
+        let data = make_dss_file(&[lp]);
+        let (frames, total) = demux_dss(&data[..2 * DSS_BLOCK_SIZE + 5]).unwrap();
         assert!(frames.is_empty());
         assert_eq!(total, 0);
     }

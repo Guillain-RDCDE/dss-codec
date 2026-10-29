@@ -1,14 +1,14 @@
 /// DS2 file demuxer.
 ///
-/// SP mode (0-1): byte-swap demuxing, returns list of 42-byte packets.
+/// SP mode (0-1): DSS SP blocks, read by the DSS SP block walk.
 /// QP mode (6): segmented continuous bitstream.
 /// QP7 mode (7): segmented 12/56-byte byte-aligned records.
-use crate::demux::ds2_header_size;
+use crate::demux::dss::dss_sp_frames;
+use crate::demux::{check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
 
 const DS2_BLOCK_SIZE: usize = 512;
-const DS2_BLOCK_HEADER_SIZE: usize = 6;
-const DSS_SP_PACKET_SIZE: usize = 42;
+pub(crate) const DS2_BLOCK_HEADER_SIZE: usize = 6;
 const DS2_QP_FRAME_SIZE: usize = 56;
 const DS2_QP7_PACKET_SHORT_SIZE: usize = 12;
 const DS2_QP7_PACKET_LONG_SIZE: usize = 56;
@@ -27,18 +27,19 @@ pub struct Ds2Qp7Segment {
     pub reset_before: bool,
 }
 
-pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
-    let num_blocks = data.len().saturating_sub(header_size) / DS2_BLOCK_SIZE;
-    for bi in 0..num_blocks {
-        let bstart = header_size + bi * DS2_BLOCK_SIZE;
-        if bstart + DS2_BLOCK_HEADER_SIZE > data.len() {
-            break;
-        }
+pub(crate) fn find_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
+    let mut bstart = header_size;
+    while bstart + DS2_BLOCK_HEADER_SIZE <= data.len() {
         if data[bstart + 2] > 0 {
-            return data[bstart + 4];
+            return Some(data[bstart + 4]);
         }
+        bstart += DS2_BLOCK_SIZE;
     }
-    0
+    None
+}
+
+pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
+    find_ds2_format_type(data, header_size).unwrap_or(0)
 }
 
 /// Demux a DS2 file.
@@ -192,52 +193,11 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             segments,
         })
     } else {
-        // SP mode: byte-swap demuxing
-        let mut stream = Vec::new();
-        for bi in 0..num_blocks {
-            let bstart = header_size + bi * DS2_BLOCK_SIZE;
-            stream
-                .extend_from_slice(&data[bstart + DS2_BLOCK_HEADER_SIZE..bstart + DS2_BLOCK_SIZE]);
-        }
-
-        let mut swap = ((data[header_size] >> 7) & 1) as usize;
-        let mut swap_byte: u8 = 0;
-        let mut pos: usize = 0;
-        let mut frame_packets = Vec::with_capacity(total_frames);
-
-        for _fi in 0..total_frames {
-            // total_frames counts every declared frame, so the walk can run
-            // past the end of the stream near EOF; clamp both ends and emit
-            // zero-padded packets instead of slicing out of range.
-            let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
-            if swap != 0 {
-                let read_size = 40;
-                let end = (pos + read_size).min(stream.len());
-                let start = pos.min(end);
-                let count = end - start;
-                pkt[3..3 + count].copy_from_slice(&stream[start..end]);
-                pos += read_size;
-                for i in (0..DSS_SP_PACKET_SIZE - 2).step_by(2) {
-                    pkt[i] = pkt[i + 4];
-                }
-                pkt[DSS_SP_PACKET_SIZE] = 0;
-                pkt[1] = swap_byte;
-            } else {
-                let end = (pos + DSS_SP_PACKET_SIZE).min(stream.len());
-                let start = pos.min(end);
-                let count = end - start;
-                pkt[..count].copy_from_slice(&stream[start..end]);
-                pos += DSS_SP_PACKET_SIZE;
-                swap_byte = pkt[DSS_SP_PACKET_SIZE - 2];
-            }
-            pkt[DSS_SP_PACKET_SIZE - 2] = 0;
-            swap ^= 1;
-            frame_packets.push(pkt[..DSS_SP_PACKET_SIZE].to_vec());
-        }
-
+        check_sp_codec(format_type)?;
+        let (packets, _cut) = dss_sp_frames(data, header_size);
         Ok(DemuxedDs2::Sp {
-            packets: frame_packets,
-            total_frames,
+            total_frames: packets.len(),
+            packets,
         })
     }
 }
@@ -255,151 +215,6 @@ pub enum DemuxedDs2 {
         segments: Vec<Ds2Qp7Segment>,
         total_frames: usize,
     },
-}
-
-pub(crate) struct Ds2SpStreamDemuxer {
-    header_size: usize,
-    header_complete: bool,
-    block_buf: Vec<u8>,
-    stream_buf: Vec<u8>,
-    pending_frames: usize,
-    swap: usize,
-    swap_byte: u8,
-    have_initial_swap: bool,
-}
-
-impl Ds2SpStreamDemuxer {
-    pub(crate) fn new(header_size: usize) -> Self {
-        Self {
-            header_size,
-            header_complete: false,
-            block_buf: Vec::new(),
-            stream_buf: Vec::new(),
-            pending_frames: 0,
-            swap: 0,
-            swap_byte: 0,
-            have_initial_swap: false,
-        }
-    }
-
-    pub(crate) fn push(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>> {
-        let mut frames = Vec::new();
-        let mut offset = 0;
-
-        if !self.header_complete {
-            let needed = self.header_size.saturating_sub(self.block_buf.len());
-            let take = needed.min(data.len());
-            self.block_buf.extend_from_slice(&data[..take]);
-            offset += take;
-            if self.block_buf.len() < self.header_size {
-                return Ok(frames);
-            }
-            self.header_complete = true;
-            self.block_buf.clear();
-        }
-
-        self.block_buf.extend_from_slice(&data[offset..]);
-        while self.block_buf.len() >= DS2_BLOCK_SIZE {
-            let block: Vec<u8> = self.block_buf.drain(..DS2_BLOCK_SIZE).collect();
-            self.process_block(&block, &mut frames);
-        }
-
-        Ok(frames)
-    }
-
-    pub(crate) fn finish(&mut self) -> Result<Vec<Vec<u8>>> {
-        if !self.header_complete {
-            if self.block_buf.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(DecodeError::Truncated("DS2 header".to_string()));
-        }
-        if !self.block_buf.is_empty() {
-            return Err(DecodeError::Truncated("DS2 block".to_string()));
-        }
-        if self.pending_frames > 0 {
-            return Err(DecodeError::Truncated("DS2 SP frame".to_string()));
-        }
-        Ok(Vec::new())
-    }
-
-    pub(crate) fn finish_lenient(&mut self) -> Result<Vec<Vec<u8>>> {
-        if !self.header_complete {
-            if self.block_buf.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(DecodeError::Truncated("DS2 header".to_string()));
-        }
-
-        self.block_buf.clear();
-
-        let mut frames = Vec::with_capacity(self.pending_frames);
-        while self.pending_frames > 0 {
-            let needed = if self.swap != 0 {
-                40
-            } else {
-                DSS_SP_PACKET_SIZE
-            };
-            frames.push(self.extract_sp_packet_padded(needed));
-            self.pending_frames -= 1;
-        }
-
-        Ok(frames)
-    }
-
-    fn process_block(&mut self, block: &[u8], frames: &mut Vec<Vec<u8>>) {
-        if !self.have_initial_swap {
-            self.swap = ((block[0] >> 7) & 1) as usize;
-            self.have_initial_swap = true;
-        }
-        self.pending_frames += block[2] as usize;
-        self.stream_buf
-            .extend_from_slice(&block[DS2_BLOCK_HEADER_SIZE..DS2_BLOCK_SIZE]);
-
-        while self.pending_frames > 0 {
-            let needed = if self.swap != 0 {
-                40
-            } else {
-                DSS_SP_PACKET_SIZE
-            };
-            if self.stream_buf.len() < needed {
-                break;
-            }
-            frames.push(self.extract_sp_packet(needed));
-            self.pending_frames -= 1;
-        }
-    }
-
-    fn extract_sp_packet(&mut self, read_size: usize) -> Vec<u8> {
-        let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
-        let chunk: Vec<u8> = self.stream_buf.drain(..read_size).collect();
-        self.fill_sp_packet(&mut pkt, &chunk);
-        pkt[..DSS_SP_PACKET_SIZE].to_vec()
-    }
-
-    fn extract_sp_packet_padded(&mut self, read_size: usize) -> Vec<u8> {
-        let take = read_size.min(self.stream_buf.len());
-        let chunk: Vec<u8> = self.stream_buf.drain(..take).collect();
-        let mut pkt = [0u8; DSS_SP_PACKET_SIZE + 1];
-        self.fill_sp_packet(&mut pkt, &chunk);
-        pkt[..DSS_SP_PACKET_SIZE].to_vec()
-    }
-
-    fn fill_sp_packet(&mut self, pkt: &mut [u8; DSS_SP_PACKET_SIZE + 1], chunk: &[u8]) {
-        if self.swap != 0 {
-            pkt[3..3 + chunk.len()].copy_from_slice(chunk);
-            for i in (0..DSS_SP_PACKET_SIZE - 2).step_by(2) {
-                pkt[i] = pkt[i + 4];
-            }
-            pkt[DSS_SP_PACKET_SIZE] = 0;
-            pkt[1] = self.swap_byte;
-        } else {
-            pkt[..chunk.len()].copy_from_slice(chunk);
-            self.swap_byte = pkt[DSS_SP_PACKET_SIZE - 2];
-        }
-        pkt[DSS_SP_PACKET_SIZE - 2] = 0;
-        self.swap ^= 1;
-    }
 }
 
 pub(crate) struct Ds2QpStreamDemuxer {
@@ -471,40 +286,91 @@ mod tests {
         data
     }
 
-    #[test]
-    fn test_ds2_sp_stream_demux_matches_batch() {
-        let data = make_ds2_file(0, 4, 0x10);
-        let expected = match demux_ds2(&data).unwrap() {
-            DemuxedDs2::Sp { packets, .. } => packets,
-            _ => panic!("expected DS2 SP packets"),
-        };
-
-        let mut demuxer = Ds2SpStreamDemuxer::new(3 * DS2_BLOCK_SIZE);
-        let mut actual = Vec::new();
-        for chunk in data.chunks(137) {
-            actual.extend(demuxer.push(chunk).unwrap());
-        }
-        actual.extend(demuxer.finish().unwrap());
-
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn test_ds2_sp_demux_overdeclared_frames_no_panic() {
-        // A block that declares more frames than its payload holds makes the
-        // frame walk run past the end of the assembled stream; the trailing
-        // packets must come back zero-padded instead of panicking.
-        let data = make_ds2_file(0, 14, 0x20);
-        let (packets, total) = match demux_ds2(&data).unwrap() {
+    fn sp_packets(data: &[u8]) -> Vec<Vec<u8>> {
+        match demux_ds2(data).unwrap() {
             DemuxedDs2::Sp {
                 packets,
                 total_frames,
-            } => (packets, total_frames),
+            } => {
+                assert_eq!(total_frames, packets.len());
+                packets
+            }
             _ => panic!("expected DS2 SP packets"),
-        };
-        assert_eq!(total, 14);
-        assert_eq!(packets.len(), 14);
-        assert!(packets.iter().all(|p| p.len() == DSS_SP_PACKET_SIZE));
+        }
+    }
+
+    #[test]
+    fn test_ds2_sp_demux_reads_dss_blocks() {
+        let data = make_ds2_file(0, 4, 0x10);
+        let mut dss = vec![0u8; 2 * DS2_BLOCK_SIZE];
+        dss[..4].copy_from_slice(b"\x02dss");
+        dss.extend_from_slice(&data[3 * DS2_BLOCK_SIZE..]);
+
+        let (expected, _) = crate::demux::dss::demux_dss(&dss).unwrap();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(sp_packets(&data), expected);
+    }
+
+    #[test]
+    fn test_ds2_sp_demux_overdeclared_frames_stop_at_end_of_file() {
+        let data = make_ds2_file(0, 14, 0x20);
+        let packets = sp_packets(&data);
+        assert_eq!(packets.len(), 12);
+        assert!(packets.iter().all(|p| p.len() == 42));
+    }
+
+    #[test]
+    fn test_ds2_sp_demux_two_block_header() {
+        let data = make_ds2_file_with_header(2, 0, 4, 0x10);
+        let short = make_ds2_file(0, 4, 0x10);
+        assert_eq!(sp_packets(&data).len(), 4);
+        assert_eq!(sp_packets(&data), sp_packets(&short));
+    }
+
+    #[test]
+    fn test_find_ds2_format_type_reads_first_block_with_frames() {
+        let mut data = make_ds2_file(6, 0, 0x10);
+        let second = make_ds2_file(7, 2, 0x10);
+        data.extend_from_slice(&second[3 * DS2_BLOCK_SIZE..]);
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(7));
+        assert_eq!(detect_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), 7);
+    }
+
+    #[test]
+    fn test_find_ds2_format_type_reads_partial_block_header() {
+        let data = make_ds2_file(6, 2, 0x10);
+        let cut = 3 * DS2_BLOCK_SIZE + DS2_BLOCK_HEADER_SIZE;
+        assert_eq!(find_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), Some(6));
+        assert_eq!(detect_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), 6);
+    }
+
+    #[test]
+    fn test_find_ds2_format_type_none_without_block_header() {
+        let data = make_ds2_file(6, 2, 0x10);
+        let cut = 3 * DS2_BLOCK_SIZE + DS2_BLOCK_HEADER_SIZE - 1;
+        assert_eq!(find_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), None);
+        assert_eq!(detect_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), 0);
+        assert_eq!(find_ds2_format_type(&data[..100], 3 * DS2_BLOCK_SIZE), None);
+    }
+
+    #[test]
+    fn test_find_ds2_format_type_none_when_no_block_has_frames() {
+        let mut data = make_ds2_file(6, 0, 0x10);
+        let second = make_ds2_file(7, 0, 0x10);
+        data.extend_from_slice(&second[3 * DS2_BLOCK_SIZE..]);
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), None);
+        assert_eq!(detect_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), 0);
+    }
+
+    #[test]
+    fn test_ds2_demux_refuses_lp_and_unknown_codecs() {
+        for mode in [2u8, 3, 4, 5] {
+            let data = make_ds2_file(mode, 4, 0x10);
+            assert!(matches!(
+                demux_ds2(&data),
+                Err(DecodeError::UnsupportedCodec(m)) if m == mode
+            ));
+        }
     }
 
     #[test]
@@ -546,24 +412,6 @@ mod tests {
             _ => panic!("expected DS2 QP stream"),
         };
         assert_eq!(frames(demux_ds2(&data).unwrap()), frames(demux_ds2(&short).unwrap()));
-    }
-
-    #[test]
-    fn test_ds2_sp_stream_demux_two_block_header() {
-        let data = make_ds2_file_with_header(2, 0, 4, 0x10);
-        let expected = match demux_ds2(&data).unwrap() {
-            DemuxedDs2::Sp { packets, .. } => packets,
-            _ => panic!("expected DS2 SP packets"),
-        };
-        assert_eq!(expected.len(), 4);
-
-        let mut demuxer = Ds2SpStreamDemuxer::new(2 * DS2_BLOCK_SIZE);
-        let mut actual = Vec::new();
-        for chunk in data.chunks(137) {
-            actual.extend(demuxer.push(chunk).unwrap());
-        }
-        actual.extend(demuxer.finish().unwrap());
-        assert_eq!(actual, expected);
     }
 
     #[test]
