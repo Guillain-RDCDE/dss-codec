@@ -49,6 +49,11 @@ header that has frames. The decoder has no LP codec. LP files, codec
 byte 2, and any codec byte missing from this table fail with
 `UnsupportedCodec`.
 
+Some files hold a stale copy of their header blocks right after the
+header. A block there that starts with a "dss" or "ds2" header is such a
+copy. The decoder skips it and the blocks that its first byte counts,
+and reads the audio after them.
+
 Encrypted DS2 files with header `\x03enc` are also supported when a password is provided, and can be either decoded directly or normalized back to a plain `.ds2` container with `--decrypt`.
 
 ## Project Structure

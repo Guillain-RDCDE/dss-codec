@@ -86,10 +86,10 @@ pub(crate) struct GrundigSpStreamDemuxer {
 }
 
 impl GrundigSpStreamDemuxer {
-    /// `header_blocks` = first byte of the file (number of 512-byte header blocks).
-    pub(crate) fn new(header_blocks: u8) -> Self {
+    /// `header_size` = offset of the first audio block.
+    pub(crate) fn new(header_size: usize) -> Self {
         Self {
-            header_size: header_blocks as usize * BLOCK_SIZE,
+            header_size,
             buf: Vec::new(),
         }
     }
@@ -173,7 +173,7 @@ mod tests {
     }
 
     fn stream_finish(file: &[u8], strict: bool) -> Result<Vec<Vec<u8>>> {
-        let mut demuxer = GrundigSpStreamDemuxer::new(6);
+        let mut demuxer = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
         for piece in file.chunks(37) {
             assert!(demuxer.push(piece).unwrap().is_empty());
         }
@@ -245,8 +245,8 @@ mod tests {
 
         let (expected, total) = demux_grundig(audio);
         assert_eq!(total, 29);
-        let mut strict = GrundigSpStreamDemuxer::new(6);
-        let mut lenient = GrundigSpStreamDemuxer::new(6);
+        let mut strict = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
+        let mut lenient = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
         for piece in file.chunks(37) {
             assert!(strict.push(piece).unwrap().is_empty());
             assert!(lenient.push(piece).unwrap().is_empty());
@@ -405,7 +405,7 @@ mod tests {
         assert_eq!(demux_grundig(&data), (Vec::<Vec<u8>>::new(), 0));
         assert_eq!(demux_grundig(&[]), (Vec::<Vec<u8>>::new(), 0));
 
-        let mut demuxer = GrundigSpStreamDemuxer::new(6);
+        let mut demuxer = GrundigSpStreamDemuxer::new(6 * BLOCK_SIZE);
         assert!(demuxer.push(&[0u8; 6 * BLOCK_SIZE]).unwrap().is_empty());
         assert!(demuxer.finish().unwrap().is_empty());
     }

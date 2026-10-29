@@ -5,7 +5,7 @@
 /// block boundaries.
 /// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
 use crate::demux::dss::{block_frames, dss_sp_frames};
-use crate::demux::{check_sp_codec, ds2_header_size};
+use crate::demux::{audio_start, check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
 
 const DS2_BLOCK_SIZE: usize = 512;
@@ -50,6 +50,7 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// For QP/QP7: one segment holding every frame in file order.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
     let header_size = ds2_header_size(data)
+        .map(|size| audio_start(data, size))
         .ok_or_else(|| DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")))?;
     let format_type = detect_ds2_format_type(data, header_size);
 
@@ -300,7 +301,7 @@ fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> (Vec<Vec<u8>>, bool)
 }
 
 pub(crate) fn qp_frame_in_progress(data: &[u8]) -> bool {
-    let Some(header_size) = ds2_header_size(data) else {
+    let Some(header_size) = ds2_header_size(data).map(|size| audio_start(data, size)) else {
         return false;
     };
     let tail = data.len().saturating_sub(header_size) % DS2_BLOCK_SIZE;

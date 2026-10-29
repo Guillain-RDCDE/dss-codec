@@ -61,7 +61,8 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         return None;
     }
     if let Some(header_size) = dss_header_size(data) {
-        if data[0] == 6 && detect_ds2_format_type(data, header_size) == 0 {
+        let start = audio_start(data, header_size);
+        if data[0] == 6 && detect_ds2_format_type(data, start) == 0 {
             return Some(AudioFormat::GrundigSp);
         }
         return Some(AudioFormat::DssSp);
@@ -75,10 +76,11 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         });
     }
     if let Some(header_size) = ds2_header_size(data) {
-        if data.len() < header_size + DS2_BLOCK_HEADER_SIZE {
+        let start = audio_start(data, header_size);
+        if data.len() < start + DS2_BLOCK_HEADER_SIZE {
             return None;
         }
-        let format_type = detect_ds2_format_type(data, header_size);
+        let format_type = detect_ds2_format_type(data, start);
         return Some(match format_type {
             7 => AudioFormat::Ds2Qp7,
             6 => AudioFormat::Ds2Qp,
@@ -105,9 +107,20 @@ pub(crate) fn dss_header_size(data: &[u8]) -> Option<usize> {
     Some(usize::from(data[0].max(1)) * 512)
 }
 
+pub(crate) fn audio_start(data: &[u8], header_size: usize) -> usize {
+    let mut start = header_size;
+    while let Some(copy) = data
+        .get(start..)
+        .and_then(|rest| dss_header_size(rest).or_else(|| ds2_header_size(rest)))
+    {
+        start += copy;
+    }
+    start
+}
+
 pub(crate) fn sp_codec(data: &[u8]) -> Option<u8> {
     let header_size = dss_header_size(data).or_else(|| ds2_header_size(data))?;
-    Some(detect_ds2_format_type(data, header_size))
+    Some(detect_ds2_format_type(data, audio_start(data, header_size)))
 }
 
 pub(crate) fn check_sp_codec(codec: u8) -> Result<()> {
@@ -287,6 +300,38 @@ mod tests {
         assert_eq!(sp_codec(&make_ds2_with_header_blocks(3, 3, 1)), Some(1));
         assert_eq!(sp_codec(&make_ds2_with_header_blocks(2, 2, 2)), Some(2));
         assert_eq!(sp_codec(b"RIFF"), None);
+    }
+
+    fn stale_header_copy(first_byte: u8, codec: u8) -> Vec<u8> {
+        let mut copy = vec![0xffu8; usize::from(first_byte) * 512];
+        copy[..6].copy_from_slice(&[first_byte, b'd', b's', b's', codec, 0]);
+        copy[512..518].copy_from_slice(&[0, 0, 0, 0, 0xff, 0xff]);
+        copy
+    }
+
+    #[test]
+    fn audio_start_skips_stale_header_copies() {
+        let plain = make_ds2_with_header_blocks(3, 3, 6);
+        assert_eq!(audio_start(&plain, 0x600), 0x600);
+        let mut data = plain.clone();
+        data.splice(0x600..0x600, stale_header_copy(3, 1));
+        assert_eq!(audio_start(&data, 0x600), 0xc00);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+        assert_eq!(sp_codec(&data), Some(6));
+        assert_eq!(audio_start(&data[..0x603], 0x600), 0x600);
+        assert_eq!(audio_start(&data[..0x604], 0x600), 0xc00);
+        assert_eq!(detect_format(&data[..0xc05]), None);
+        assert_eq!(detect_format(&data[..0xc06]), Some(AudioFormat::Ds2Qp));
+
+        let mut dss = make_ds2_with_header_blocks(2, 2, 1);
+        dss[1..4].copy_from_slice(b"dss");
+        dss.splice(0x400..0x400, stale_header_copy(2, 2));
+        assert_eq!(audio_start(&dss, 0x400), 0x800);
+        assert_eq!(sp_codec(&dss), Some(1));
+        dss.splice(0x400..0x400, stale_header_copy(3, 2));
+        assert_eq!(audio_start(&dss, 0x400), 0xe00);
+        assert_eq!(sp_codec(&dss), Some(1));
+        assert_eq!(detect_format(&dss), Some(AudioFormat::DssSp));
     }
 
     #[test]

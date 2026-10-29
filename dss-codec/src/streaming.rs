@@ -8,7 +8,8 @@ use crate::demux::ds2::{
 use crate::demux::dss::DssSpStreamDemuxer;
 use crate::demux::grundig::GrundigSpStreamDemuxer;
 use crate::demux::{
-    check_sp_codec, detect_format, ds2_header_size, dss_header_size, sp_codec, AudioFormat,
+    audio_start, check_sp_codec, detect_format, ds2_header_size, dss_header_size, sp_codec,
+    AudioFormat,
 };
 use crate::error::{DecodeError, Result};
 
@@ -165,8 +166,10 @@ impl StreamingDecoder {
                 AudioFormat::DssSp | AudioFormat::GrundigSp => dss_header_size(&self.prebuffer),
                 _ => ds2_header_size(&self.prebuffer),
             };
-            let codec_pending = header_size
-                .is_some_and(|size| find_ds2_format_type(&self.prebuffer, size).is_none());
+            let codec_pending = header_size.is_some_and(|size| {
+                let start = audio_start(&self.prebuffer, size);
+                find_ds2_format_type(&self.prebuffer, start).is_none()
+            });
             if codec_pending && !at_end {
                 return Ok(false);
             }
@@ -197,9 +200,9 @@ impl StreamingDecoder {
         self.format = Some(format);
         match format {
             AudioFormat::DssSp => {
-                let version = self.prebuffer[0];
-                self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::new(
-                    version,
+                let header_size = dss_header_size(&self.prebuffer).unwrap_or(512);
+                self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::with_header_size(
+                    audio_start(&self.prebuffer, header_size),
                     variable_rate,
                 )));
                 self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
@@ -209,7 +212,7 @@ impl StreamingDecoder {
             AudioFormat::Ds2Sp => {
                 let header_size = ds2_header_size(&self.prebuffer).unwrap_or(3 * 512);
                 self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::with_header_size(
-                    header_size,
+                    audio_start(&self.prebuffer, header_size),
                     variable_rate,
                 )));
                 self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
@@ -221,9 +224,10 @@ impl StreamingDecoder {
                 self.decoder = Some(ActiveDecoder::Ds2Qp(Ds2QpDecoder::new()));
             }
             AudioFormat::GrundigSp => {
-                let header_blocks = self.prebuffer[0];
-                self.demuxer =
-                    Some(ActiveDemuxer::Grundig(GrundigSpStreamDemuxer::new(header_blocks)));
+                let header_size = dss_header_size(&self.prebuffer).unwrap_or(6 * 512);
+                self.demuxer = Some(ActiveDemuxer::Grundig(GrundigSpStreamDemuxer::new(
+                    audio_start(&self.prebuffer, header_size),
+                )));
                 self.decoder = Some(ActiveDecoder::Grundig(GrundigSpDecoder::new()));
             }
         }
@@ -654,6 +658,42 @@ mod tests {
         let buffer = crate::decode_to_buffer(&grundig).unwrap();
         assert_eq!(buffer.format, AudioFormat::GrundigSp);
         assert_eq!(buffer.native_rate, 16000);
+    }
+
+    fn stale_header_copy(first_byte: u8, codec: u8) -> Vec<u8> {
+        let mut copy = vec![0xffu8; usize::from(first_byte) * 512];
+        copy[..6].copy_from_slice(&[first_byte, b'd', b's', b's', codec, 0]);
+        copy[512..518].copy_from_slice(&[0, 0, 0, 0, 0xff, 0xff]);
+        copy
+    }
+
+    #[test]
+    fn test_streaming_decoder_skips_stale_header_copy() {
+        for (prefix, header_size, copy_codec, codec, what) in [
+            (b"\x02dss", 0x400, 2u8, 1u8, "DSS header"),
+            (b"\x06dss", 0xc00, 2, 1, "Grundig header"),
+            (b"\x06dss", 0xc00, 1, 0, "Grundig header"),
+            (b"\x03ds2", 0x600, 0, 1, "DS2 header"),
+            (b"\x03ds2", 0x600, 1, 6, "DS2 header"),
+        ] {
+            let plain = sp_file(prefix, header_size, codec);
+            let (expected, format) = stream_decode(&plain, 100).unwrap();
+            assert!(!expected.is_empty());
+            let mut data = plain[..header_size].to_vec();
+            data.extend_from_slice(&stale_header_copy(prefix[0], copy_codec));
+            data.extend_from_slice(&plain[header_size..]);
+            for chunk in [7, 100, data.len()] {
+                assert_eq!(stream_decode(&data, chunk).unwrap(), (expected.clone(), format));
+            }
+            assert_eq!(crate::decode_to_buffer(&data).unwrap().samples, expected);
+
+            let cut = &data[..header_size + 512];
+            assert!(matches!(stream_decode(cut, 7), Err(DecodeError::Truncated(w)) if w == what));
+            assert!(matches!(
+                crate::decode_to_buffer(cut),
+                Err(DecodeError::Truncated(w)) if w == what
+            ));
+        }
     }
 
     #[test]

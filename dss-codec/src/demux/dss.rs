@@ -22,6 +22,7 @@ pub(crate) fn block_frames(header: &[u8]) -> usize {
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let header_size = crate::demux::dss_header_size(data)
+        .map(|size| crate::demux::audio_start(data, size))
         .ok_or_else(|| DecodeError::NotDss(std::path::PathBuf::from("<bytes>")))?;
     if data.len() < header_size {
         return Err(DecodeError::Truncated("DSS header".to_string()));
@@ -247,6 +248,7 @@ pub(crate) struct DssSpStreamDemuxer {
 }
 
 impl DssSpStreamDemuxer {
+    #[cfg(test)]
     pub(crate) fn new(version: u8, variable_rate: bool) -> Self {
         Self::with_header_size(usize::from(version.max(1)) * DSS_BLOCK_SIZE, variable_rate)
     }
