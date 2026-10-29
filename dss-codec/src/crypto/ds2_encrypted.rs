@@ -895,14 +895,35 @@ mod tests {
     }
 
     #[test]
-    fn decrypting_decoder_strict_finish_rejects_partial_block() {
+    fn decrypting_decoder_strict_finish_accepts_cut_without_frame_in_progress() {
         let data = encrypted_qp_file(3);
-        let mut decoder = crate::streaming::DecryptingDecoderStreamer::new(Some(b"1234"));
-        let _ = decoder
-            .push(&data[..2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE + 100])
-            .unwrap();
-        let err = decoder.finish().unwrap_err();
-        assert!(matches!(err, DecodeError::Truncated(_)));
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        for (cut, frames) in [(1, 18), (DS2_BLOCK_SIZE - 1, 27)] {
+            let mut decoder = crate::streaming::DecryptingDecoderStreamer::new(Some(b"1234"));
+            let mut samples = decoder.push(&data[..whole + cut]).unwrap();
+            samples.extend(decoder.finish().unwrap());
+            assert_eq!(samples.len(), frames * 256, "cut {cut}");
+            let lenient =
+                crate::decode_to_buffer_with_password(&data[..whole + cut], Some(b"1234")).unwrap();
+            assert_eq!(samples, lenient.samples, "cut {cut}");
+        }
+    }
+
+    #[test]
+    fn decrypting_decoder_strict_finish_rejects_frame_in_progress() {
+        let data = encrypted_qp_file(3);
+        let whole = 2 * DS2_BLOCK_SIZE + DS2_HEADER_SIZE;
+        for cut in [DS2_BLOCK_HEADER_SIZE, 62, 100] {
+            let mut decoder = crate::streaming::DecryptingDecoderStreamer::new(Some(b"1234"));
+            let _ = decoder.push(&data[..whole + cut]).unwrap();
+            assert!(
+                matches!(
+                    decoder.finish(),
+                    Err(DecodeError::Truncated(what)) if what == "DS2 QP frame"
+                ),
+                "cut {cut}"
+            );
+        }
     }
 
     #[test]

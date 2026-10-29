@@ -21,11 +21,8 @@ pub(crate) fn block_frames(header: &[u8]) -> usize {
 }
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
-    if data.len() < 4 || data[1..4] != *b"dss" || (data[0] != 2 && data[0] != 3) {
-        return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
-    }
-
-    let header_size = data[0] as usize * DSS_BLOCK_SIZE;
+    let header_size = crate::demux::dss_header_size(data)
+        .ok_or_else(|| DecodeError::NotDss(std::path::PathBuf::from("<bytes>")))?;
     if data.len() < header_size {
         return Err(DecodeError::Truncated("DSS header".to_string()));
     }
@@ -251,7 +248,7 @@ pub(crate) struct DssSpStreamDemuxer {
 
 impl DssSpStreamDemuxer {
     pub(crate) fn new(version: u8, variable_rate: bool) -> Self {
-        Self::with_header_size(version as usize * DSS_BLOCK_SIZE, variable_rate)
+        Self::with_header_size(usize::from(version.max(1)) * DSS_BLOCK_SIZE, variable_rate)
     }
 
     pub(crate) fn with_header_size(header_size: usize, variable_rate: bool) -> Self {
@@ -747,9 +744,102 @@ mod tests {
     #[test]
     fn test_dss_demux_rejects_other_magic() {
         let mut data = make_dss_file(&[make_dss_block(0, 3, 1, 0x20)]);
-        data[0] = 6;
+        data[3] = b'2';
         assert!(matches!(demux_dss(&data), Err(DecodeError::NotDss(_))));
         assert!(matches!(demux_dss(b"\x02ds"), Err(DecodeError::NotDss(_))));
+    }
+
+    fn with_header_blocks(first_byte: u8, audio: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; usize::from(first_byte.max(1)) * DSS_BLOCK_SIZE];
+        data[0] = first_byte;
+        data[1..4].copy_from_slice(b"dss");
+        data.extend_from_slice(audio);
+        data
+    }
+
+    const EMPTY_HEADER_BLOCK: [u8; DSS_BLOCK_HEADER_SIZE] = [0xc0, 0x5d, 0, 0, 0xff, 0xff];
+
+    #[test]
+    fn test_dss_demux_reads_header_of_any_block_count() {
+        let base = make_dss_file(&[
+            make_dss_block(0, 3, 13, 0x10),
+            make_dss_block(1, 16, 1, 0x80),
+        ]);
+        let (expected, total) = demux_dss(&base).unwrap();
+        for first_byte in [3u8, 6, 8, 19, 255] {
+            let data = with_header_blocks(first_byte, &base[2 * DSS_BLOCK_SIZE..]);
+            assert_eq!(demux_dss(&data).unwrap(), (expected.clone(), total));
+            let mut demuxer = DssSpStreamDemuxer::new(first_byte, false);
+            assert_eq!(collect_frames(&mut demuxer, &data, 97), expected);
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_reads_one_block_header() {
+        let first = make_dss_block(0, 3, 3, 0x20);
+        let second = make_dss_block(0, 3, 3, 0x40);
+        let base = make_dss_file(&[first, second]);
+        let (expected, _) = demux_dss(&base).unwrap();
+        let (copied, _) = demux_dss(&make_dss_file(&[first, first, second])).unwrap();
+        for first_byte in [0u8, 1] {
+            let mut data = base.clone();
+            data[0] = first_byte;
+            data[DSS_BLOCK_SIZE..2 * DSS_BLOCK_SIZE].fill(0x55);
+            data[DSS_BLOCK_SIZE..DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE]
+                .copy_from_slice(&EMPTY_HEADER_BLOCK);
+            assert_eq!(demux_dss(&data).unwrap().0, expected);
+
+            data[DSS_BLOCK_SIZE..2 * DSS_BLOCK_SIZE].copy_from_slice(&first);
+            assert_eq!(demux_dss(&data).unwrap().0, copied);
+            let mut demuxer = DssSpStreamDemuxer::new(first_byte, false);
+            assert_eq!(collect_frames(&mut demuxer, &data, 61), copied);
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_long_header_cut_is_truncated() {
+        for first_byte in [8u8, 19, 255] {
+            let mut data = with_header_blocks(first_byte, &[]);
+            data[2 * DSS_BLOCK_SIZE..3 * DSS_BLOCK_SIZE]
+                .copy_from_slice(&make_dss_block(0, 3, 3, 0x20));
+            data.pop();
+            assert!(matches!(
+                demux_dss(&data),
+                Err(DecodeError::Truncated(what)) if what == "DSS header"
+            ));
+            for strict in [true, false] {
+                let mut demuxer = DssSpStreamDemuxer::new(first_byte, false);
+                assert!(demuxer.push(&data).unwrap().is_empty());
+                let result = if strict {
+                    demuxer.finish()
+                } else {
+                    demuxer.finish_lenient()
+                };
+                assert!(matches!(
+                    result,
+                    Err(DecodeError::Truncated(what)) if what == "DSS header"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_refuses_lp_after_short_or_long_header() {
+        let mut lp = make_dss_block(0, 3, 3, 0x20);
+        lp[4] = 2;
+        for first_byte in [0u8, 1] {
+            let mut data = make_dss_file(&[lp]);
+            data[0] = first_byte;
+            data[DSS_BLOCK_SIZE..DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE]
+                .copy_from_slice(&EMPTY_HEADER_BLOCK);
+            let result = demux_dss(&data);
+            assert!(matches!(result, Err(DecodeError::UnsupportedCodec(2))));
+        }
+        for first_byte in [8u8, 19] {
+            let data = with_header_blocks(first_byte, &lp);
+            let result = demux_dss(&data);
+            assert!(matches!(result, Err(DecodeError::UnsupportedCodec(2))));
+        }
     }
 
     const PAYLOAD: usize = 2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE;

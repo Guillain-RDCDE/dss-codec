@@ -17,7 +17,8 @@ pub enum AudioFormat {
     Ds2Qp,
     /// DS2 file (.ds2), QP7 mode (mode byte 7), 16000 Hz
     Ds2Qp7,
-    /// Grundig DSS file (first byte 6, magic "dss"), SP codec at 16000 Hz output
+    /// Grundig DSS file (first byte 6, magic "dss", codec byte 0), SP codec at
+    /// 16000 Hz output
     GrundigSp,
 }
 
@@ -59,10 +60,10 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     if data.len() < 4 {
         return None;
     }
-    if data[1..4] == *b"dss" && data[0] == 6 {
-        return Some(AudioFormat::GrundigSp);
-    }
-    if data[1..4] == *b"dss" && (data[0] == 2 || data[0] == 3) {
+    if let Some(header_size) = dss_header_size(data) {
+        if data[0] == 6 && detect_ds2_format_type(data, header_size) == 0 {
+            return Some(AudioFormat::GrundigSp);
+        }
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() >= 0x600 + DS2_BLOCK_HEADER_SIZE {
@@ -97,12 +98,15 @@ pub(crate) fn ds2_header_size(data: &[u8]) -> Option<usize> {
     Some(usize::from(data[0]) * 512)
 }
 
+pub(crate) fn dss_header_size(data: &[u8]) -> Option<usize> {
+    if data.len() < 4 || data[1..4] != *b"dss" {
+        return None;
+    }
+    Some(usize::from(data[0].max(1)) * 512)
+}
+
 pub(crate) fn sp_codec(data: &[u8]) -> Option<u8> {
-    let header_size = if data.len() >= 4 && data[1..4] == *b"dss" {
-        data[0] as usize * 512
-    } else {
-        ds2_header_size(data)?
-    };
+    let header_size = dss_header_size(data).or_else(|| ds2_header_size(data))?;
     Some(detect_ds2_format_type(data, header_size))
 }
 
@@ -182,6 +186,53 @@ mod tests {
         assert_eq!(ds2_header_size(b"\x03enc"), None);
         assert_eq!(ds2_header_size(b"\x03ds"), None);
         assert_eq!(ds2_header_size(b""), None);
+    }
+
+    #[test]
+    fn dss_header_size_takes_block_count_from_first_byte() {
+        for (first_byte, size) in [
+            (0u8, 512),
+            (1, 512),
+            (2, 1024),
+            (3, 1536),
+            (6, 3072),
+            (8, 4096),
+            (19, 9728),
+            (255, 130560),
+        ] {
+            let prefix = [first_byte, b'd', b's', b's'];
+            assert_eq!(dss_header_size(&prefix), Some(size));
+            let format = if first_byte == 6 {
+                AudioFormat::GrundigSp
+            } else {
+                AudioFormat::DssSp
+            };
+            assert_eq!(detect_format(&prefix), Some(format));
+        }
+    }
+
+    #[test]
+    fn detect_format_keeps_grundig_for_codec_0_after_six_blocks() {
+        let mut data = make_ds2_with_header_blocks(6, 6, 0);
+        data[1..4].copy_from_slice(b"dss");
+        assert_eq!(detect_format(&data), Some(AudioFormat::GrundigSp));
+        for codec in [1u8, 2, 6, 0xff] {
+            data[6 * 512 + 4] = codec;
+            assert_eq!(detect_format(&data), Some(AudioFormat::DssSp));
+            assert_eq!(sp_codec(&data), Some(codec));
+            assert_eq!(detect_format(&data[..6 * 512 + 5]), Some(AudioFormat::GrundigSp));
+            data[6 * 512 + 2] = 0;
+            assert_eq!(detect_format(&data), Some(AudioFormat::GrundigSp));
+            data[6 * 512 + 2] = 1;
+        }
+    }
+
+    #[test]
+    fn dss_header_size_rejects_other_prefixes() {
+        for prefix in [&b"\x02ds2"[..], b"\x08dsx", b"\x03enc", b"\x02ds", b""] {
+            assert_eq!(dss_header_size(prefix), None);
+        }
+        assert_eq!(detect_format(b"\x08dsx"), None);
     }
 
     #[test]

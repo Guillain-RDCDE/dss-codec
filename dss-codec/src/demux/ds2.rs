@@ -54,7 +54,7 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
     let format_type = detect_ds2_format_type(data, header_size);
 
     if format_type == 7 {
-        let records = qp_frames(data, header_size, true);
+        let (records, _cut) = qp_frames(data, header_size, true);
         let total_frames = records.len();
         let segments = if records.is_empty() {
             Vec::new()
@@ -70,7 +70,7 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             total_frames,
         })
     } else if format_type == 6 {
-        let frames = qp_frames(data, header_size, false);
+        let (frames, _cut) = qp_frames(data, header_size, false);
         let total_frames = frames.len();
         let segments = if frames.is_empty() {
             Vec::new()
@@ -163,6 +163,7 @@ struct QpFrameReader<'a> {
     blk_frames: isize,
     frame_size: usize,
     resync_drop: bool,
+    cut: bool,
 }
 
 impl QpFrameReader<'_> {
@@ -271,13 +272,14 @@ impl QpFrameReader<'_> {
         if offset < self.frame_size {
             frame[offset..self.frame_size].fill(0);
             self.counter = 0;
+            self.cut = true;
         }
         self.frames_read += 1;
         Some(frame[..self.frame_size].to_vec())
     }
 }
 
-fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> Vec<Vec<u8>> {
+fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> (Vec<Vec<u8>>, bool) {
     let mut reader = QpFrameReader {
         data,
         pos: header_size,
@@ -288,12 +290,29 @@ fn qp_frames(data: &[u8], header_size: usize, qp7: bool) -> Vec<Vec<u8>> {
         blk_frames: 0,
         frame_size: DS2_QP_FRAME_SIZE,
         resync_drop: false,
+        cut: false,
     };
     let mut frames = Vec::new();
     while let Some(frame) = reader.read_frame() {
         frames.push(frame);
     }
-    frames
+    (frames, reader.cut)
+}
+
+pub(crate) fn qp_frame_in_progress(data: &[u8]) -> bool {
+    let Some(header_size) = ds2_header_size(data) else {
+        return false;
+    };
+    let tail = data.len().saturating_sub(header_size) % DS2_BLOCK_SIZE;
+    if tail == 0 {
+        return false;
+    }
+    let qp7 = detect_ds2_format_type(data, header_size) == 7;
+    let last = &data[data.len() - tail..];
+    if last.len() >= DS2_BLOCK_HEADER_SIZE && block_frames(last) > block_frames_held(last, qp7).0 {
+        return true;
+    }
+    qp_frames(data, header_size, qp7).1
 }
 
 pub enum DemuxedDs2 {
@@ -749,6 +768,72 @@ mod tests {
         let mut data = qp_file(&[qp_block(anchor_byte(0), 3, 0xff, 6, &stream_bytes(0, 506))]);
         data.extend_from_slice(&[0, anchor_byte(0), 5, 0]);
         assert_eq!(qp_frames_of(&data), stream_frames(3));
+    }
+
+    #[test]
+    fn test_ds2_qp_frame_in_progress_false_without_one() {
+        let spill = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 9, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        assert!(!qp_frame_in_progress(&spill));
+
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 9, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(0), 3, 0xff, 6, &stream_bytes(504, 506)),
+        ]);
+        let second = 4 * DS2_BLOCK_SIZE;
+        for end in [
+            second + 1,
+            second + DS2_BLOCK_HEADER_SIZE - 1,
+            second + DS2_BLOCK_HEADER_SIZE + 3 * DS2_QP_FRAME_SIZE,
+            second + 300,
+            data.len(),
+        ] {
+            assert!(!qp_frame_in_progress(&data[..end]), "end {end}");
+        }
+        assert!(!qp_frame_in_progress(&data[..3 * DS2_BLOCK_SIZE - 1]));
+    }
+
+    #[test]
+    fn test_ds2_qp_frame_in_progress_inside_cut_block() {
+        let data = qp_file(&[qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506))]);
+        let first = 3 * DS2_BLOCK_SIZE;
+        for end in [
+            first + DS2_BLOCK_HEADER_SIZE,
+            first + DS2_BLOCK_HEADER_SIZE + 5 * DS2_QP_FRAME_SIZE,
+            first + 300,
+            first + DS2_BLOCK_SIZE - 1,
+        ] {
+            assert!(qp_frame_in_progress(&data[..end]), "end {end}");
+        }
+
+        let mut payload = stream_bytes(0, 506);
+        payload[1] &= 0x7f;
+        payload[13] |= 0x80;
+        let qp7 = qp_file(&[qp_block(anchor_byte(0), 2, 0xff, 7, &payload)]);
+        let type_byte = first + DS2_BLOCK_HEADER_SIZE + 13;
+        assert!(qp_frame_in_progress(&qp7[..type_byte]));
+        assert!(!qp_frame_in_progress(&qp7[..type_byte + 55]));
+    }
+
+    #[test]
+    fn test_ds2_qp_frame_in_progress_from_earlier_block() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 8, 0xff, 6, &stream_bytes(506, 506)),
+        ]);
+        let second = 4 * DS2_BLOCK_SIZE;
+        assert!(!qp_frame_in_progress(&data[..second]));
+        for end in [
+            second + 1,
+            second + DS2_BLOCK_HEADER_SIZE - 1,
+            second + DS2_BLOCK_HEADER_SIZE,
+            second + DS2_BLOCK_HEADER_SIZE + 53,
+        ] {
+            assert!(qp_frame_in_progress(&data[..end]), "end {end}");
+            assert_eq!(qp_frames_of(&data[..end]).len(), 10);
+        }
     }
 
     #[test]
