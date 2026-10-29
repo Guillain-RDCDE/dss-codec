@@ -191,22 +191,33 @@ impl StreamingDecoder {
     }
 
     fn initialize_for_format(&mut self, format: AudioFormat) -> Result<()> {
+        let mut codec = 0;
         if matches!(format, AudioFormat::DssSp | AudioFormat::Ds2Sp) {
-            check_sp_codec(sp_codec(&self.prebuffer).unwrap_or(0))?;
+            codec = sp_codec(&self.prebuffer).unwrap_or(0);
+            check_sp_codec(codec)?;
         }
+        let variable_rate = codec == 1;
         self.format = Some(format);
         match format {
             AudioFormat::DssSp => {
                 let version = self.prebuffer[0];
-                self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::new(version)));
-                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::new()));
+                self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::new(
+                    version,
+                    variable_rate,
+                )));
+                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
+                    variable_rate,
+                )));
             }
             AudioFormat::Ds2Sp => {
                 let header_size = ds2_header_size(&self.prebuffer).unwrap_or(3 * 512);
                 self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::with_header_size(
                     header_size,
+                    variable_rate,
                 )));
-                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::new()));
+                self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::with_variable_rate(
+                    variable_rate,
+                )));
             }
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => {
                 self.demuxer = Some(ActiveDemuxer::Ds2Qp(Ds2QpStreamDemuxer::new()));
@@ -505,6 +516,23 @@ mod tests {
         assert_eq!(ds2_samples.len(), 3 * 264);
         assert_eq!(ds2_samples, dss_samples);
         assert_eq!(crate::decode_to_buffer(&ds2).unwrap().samples, dss_samples);
+    }
+
+    #[test]
+    fn test_streaming_decoder_variable_rate_matches_batch() {
+        let dss = sp_file(b"\x02dss", 0x400, 1);
+        let ds2 = sp_file(b"\x03ds2", 0x600, 1);
+        let (dss_samples, dss_format) = stream_decode(&dss, 100).unwrap();
+        let (ds2_samples, ds2_format) = stream_decode(&ds2, 1).unwrap();
+        assert_eq!(dss_format, Some(AudioFormat::DssSp));
+        assert_eq!(ds2_format, Some(AudioFormat::Ds2Sp));
+        assert_eq!(dss_samples.len(), 3 * 264);
+        assert_eq!(ds2_samples, dss_samples);
+        assert_eq!(crate::decode_to_buffer(&dss).unwrap().samples, dss_samples);
+        assert_eq!(crate::decode_to_buffer(&ds2).unwrap().samples, dss_samples);
+
+        let (fixed, _) = stream_decode(&sp_file(b"\x02dss", 0x400, 0), 100).unwrap();
+        assert_ne!(fixed, dss_samples);
     }
 
     #[test]

@@ -194,7 +194,7 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
         })
     } else {
         check_sp_codec(format_type)?;
-        let (packets, _cut) = dss_sp_frames(data, header_size);
+        let (packets, _cut) = dss_sp_frames(data, header_size, format_type == 1);
         Ok(DemuxedDs2::Sp {
             total_frames: packets.len(),
             packets,
@@ -317,6 +317,19 @@ mod tests {
         let packets = sp_packets(&data);
         assert_eq!(packets.len(), 12);
         assert!(packets.iter().all(|p| p.len() == 42));
+    }
+
+    #[test]
+    fn test_ds2_variable_rate_demux_matches_dss_twin() {
+        let data = make_ds2_file(1, 4, 0x70);
+        let mut dss = vec![0u8; 2 * DS2_BLOCK_SIZE];
+        dss[..4].copy_from_slice(b"\x02dss");
+        dss.extend_from_slice(&data[3 * DS2_BLOCK_SIZE..]);
+
+        let (expected, _) = crate::demux::dss::demux_dss(&dss).unwrap();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(sp_packets(&data), expected);
+        assert_ne!(sp_packets(&data), sp_packets(&make_ds2_file(0, 4, 0x70)));
     }
 
     #[test]

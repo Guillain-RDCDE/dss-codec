@@ -9,6 +9,7 @@ use crate::error::{DecodeError, Result};
 const DSS_BLOCK_SIZE: usize = 512;
 const DSS_BLOCK_HEADER_SIZE: usize = 6;
 const DSS_SP_FRAME_SIZE: usize = 42;
+const DSS_SP_SHORT_FRAME_SIZE: usize = 9;
 const DSS_SP_PACKET_BUF: usize = 48;
 
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
@@ -22,13 +23,17 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     }
     let codec = crate::demux::ds2::detect_ds2_format_type(data, header_size);
     crate::demux::check_sp_codec(codec)?;
-    let (frames, _cut) = dss_sp_frames(data, header_size);
+    let (frames, _cut) = dss_sp_frames(data, header_size, codec == 1);
     let total_frames = frames.len();
     Ok((frames, total_frames))
 }
 
-pub(crate) fn dss_sp_frames(data: &[u8], header_size: usize) -> (Vec<Vec<u8>>, bool) {
-    let mut walker = DssSpWalker::new(header_size);
+pub(crate) fn dss_sp_frames(
+    data: &[u8],
+    header_size: usize,
+    variable_rate: bool,
+) -> (Vec<Vec<u8>>, bool) {
+    let mut walker = DssSpWalker::new(header_size, variable_rate);
     let src = DssBytes {
         data,
         base: 0,
@@ -87,6 +92,7 @@ enum DssStep {
 #[derive(Clone, Copy)]
 struct DssSpWalker {
     header_size: usize,
+    variable_rate: bool,
     block_pos: usize,
     pos: usize,
     frames_left: usize,
@@ -95,9 +101,10 @@ struct DssSpWalker {
 }
 
 impl DssSpWalker {
-    fn new(header_size: usize) -> Self {
+    fn new(header_size: usize, variable_rate: bool) -> Self {
         Self {
             header_size,
+            variable_rate,
             block_pos: header_size - DSS_BLOCK_SIZE,
             pos: header_size,
             frames_left: 0,
@@ -125,12 +132,30 @@ impl DssSpWalker {
             }
         }
 
-        let size = DSS_SP_FRAME_SIZE - 1;
+        let mut size = DSS_SP_FRAME_SIZE - 1;
+        let mut done = 0;
         let mut pkt = [0u8; DSS_SP_PACKET_BUF];
+        if self.variable_rate {
+            if self.swap {
+                if self.swap_byte.is_some_and(|byte| byte & 0x80 == 0) {
+                    size = DSS_SP_SHORT_FRAME_SIZE;
+                }
+            } else {
+                match self.read_payload(src, &mut pkt[..2]) {
+                    Err(Short::End) => return Ok(DssStep::End { cut: true }),
+                    other => other?,
+                }
+                done = 2;
+                if pkt[1] & 0x80 == 0 {
+                    size = DSS_SP_SHORT_FRAME_SIZE;
+                }
+            }
+        }
+
         let read = if self.swap {
             self.read_payload(src, &mut pkt[3..3 + size - 1])
         } else {
-            self.read_payload(src, &mut pkt[..size + 1])
+            self.read_payload(src, &mut pkt[done..size + 1])
         };
         match read {
             Err(Short::End) => return Ok(DssStep::End { cut: true }),
@@ -217,13 +242,13 @@ pub(crate) struct DssSpStreamDemuxer {
 }
 
 impl DssSpStreamDemuxer {
-    pub(crate) fn new(version: u8) -> Self {
-        Self::with_header_size(version as usize * DSS_BLOCK_SIZE)
+    pub(crate) fn new(version: u8, variable_rate: bool) -> Self {
+        Self::with_header_size(version as usize * DSS_BLOCK_SIZE, variable_rate)
     }
 
-    pub(crate) fn with_header_size(header_size: usize) -> Self {
+    pub(crate) fn with_header_size(header_size: usize, variable_rate: bool) -> Self {
         Self {
-            walker: DssSpWalker::new(header_size),
+            walker: DssSpWalker::new(header_size, variable_rate),
             buf: Vec::new(),
             base: 0,
         }
@@ -333,7 +358,7 @@ mod tests {
         let data = make_dss_file(&[make_dss_block(0, 0, 3, 0x20)]);
 
         let (expected, _) = demux_dss(&data).unwrap();
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let actual = collect_frames(&mut demuxer, &data, 149);
 
         assert_eq!(actual, expected);
@@ -348,7 +373,7 @@ mod tests {
         ]);
 
         let (expected, _) = demux_dss(&data).unwrap();
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let actual = collect_frames(&mut demuxer, &data, 127);
 
         assert_eq!(actual, expected);
@@ -370,7 +395,7 @@ mod tests {
         assert_eq!(last_whole[14], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE]);
         assert_eq!(frames[13][1], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE + 26]);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &data, 61), frames);
     }
 
@@ -389,7 +414,7 @@ mod tests {
         assert_eq!(frames[1][1], in_file);
         assert_eq!(frames[1][40], 0);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &data, 7), frames);
     }
 
@@ -404,7 +429,7 @@ mod tests {
         assert_eq!(frames[0][..40], payload[40..80]);
         assert_eq!(frames[1][1], payload[80]);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &data, 33), frames);
     }
 
@@ -418,7 +443,7 @@ mod tests {
         assert_eq!(frames, expected);
         assert_eq!(frames.len(), 3);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &whole[..end], 50), frames);
     }
 
@@ -430,7 +455,7 @@ mod tests {
         let (frames, _) = demux_dss(&data).unwrap();
         assert_eq!(frames.len(), 3);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &data, 100).len(), 3);
     }
 
@@ -443,12 +468,12 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(frames.len(), 2);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let _ = demuxer.push(&whole[..end]).unwrap();
         let err = demuxer.finish().unwrap_err();
         assert!(matches!(err, DecodeError::Truncated(_)));
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let mut lenient = demuxer.push(&whole[..end]).unwrap();
         lenient.extend(demuxer.finish_lenient().unwrap());
         assert_eq!(lenient, frames);
@@ -468,7 +493,7 @@ mod tests {
     fn test_dss_stream_demux_truncated_frame() {
         let data = make_dss_file(&[make_dss_block(0, 0, 20, 0x30)]);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         for chunk in data[..data.len() - 100].chunks(211) {
             let _ = demuxer.push(chunk).unwrap();
         }
@@ -488,7 +513,7 @@ mod tests {
         let (frames, _) = demux_dss(data).unwrap();
         assert_eq!(frames.len(), 12);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, data, 70), frames);
     }
 
@@ -503,11 +528,11 @@ mod tests {
             let (frames, _) = demux_dss(data).unwrap();
             assert_eq!(frames.len(), 12);
 
-            let mut demuxer = DssSpStreamDemuxer::new(2);
+            let mut demuxer = DssSpStreamDemuxer::new(2, false);
             let _ = demuxer.push(data).unwrap();
             assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
 
-            let mut demuxer = DssSpStreamDemuxer::new(2);
+            let mut demuxer = DssSpStreamDemuxer::new(2, false);
             let mut lenient = demuxer.push(data).unwrap();
             lenient.extend(demuxer.finish_lenient().unwrap());
             assert_eq!(lenient, frames);
@@ -521,11 +546,11 @@ mod tests {
         let (frames, _) = demux_dss(&whole[..end]).unwrap();
         assert_eq!(frames.len(), 3);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let _ = demuxer.push(&whole[..end]).unwrap();
         assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let mut lenient = demuxer.push(&whole[..end]).unwrap();
         lenient.extend(demuxer.finish_lenient().unwrap());
         assert_eq!(lenient, frames);
@@ -535,11 +560,11 @@ mod tests {
     fn test_dss_stream_demux_truncated_header() {
         let data = make_dss_file(&[]);
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let _ = demuxer.push(&data[..100]).unwrap();
         assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
 
-        let mut demuxer = DssSpStreamDemuxer::new(2);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
         let _ = demuxer.push(&data[..100]).unwrap();
         assert!(matches!(demuxer.finish_lenient(), Err(DecodeError::Truncated(_))));
     }
@@ -643,5 +668,102 @@ mod tests {
         data[0] = 6;
         assert!(matches!(demux_dss(&data), Err(DecodeError::NotDss(_))));
         assert!(matches!(demux_dss(b"\x02ds"), Err(DecodeError::NotDss(_))));
+    }
+
+    const PAYLOAD: usize = 2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE;
+
+    fn vr_payload() -> Vec<u8> {
+        let mut payload: Vec<u8> = (1..=100).collect();
+        payload[19] |= 0x80;
+        payload[58] |= 0x80;
+        payload
+    }
+
+    fn vr_file(payload: &[u8], swap: u8, byte1: u8, frame_count: u8, codec: u8) -> Vec<u8> {
+        let mut block = [0u8; DSS_BLOCK_SIZE];
+        block[0] = swap << 7;
+        block[1] = byte1;
+        block[2] = frame_count;
+        block[4] = codec;
+        block[DSS_BLOCK_HEADER_SIZE..DSS_BLOCK_HEADER_SIZE + payload.len()].copy_from_slice(payload);
+        make_dss_file(&[block])
+    }
+
+    #[test]
+    fn test_dss_variable_rate_frame_sizes() {
+        let payload = vr_payload();
+        let data = vr_file(&payload, 0, 3, 4, 1);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 4);
+        assert!(frames.iter().all(|f| f.len() == DSS_SP_FRAME_SIZE));
+
+        assert_eq!(frames[0][..8], payload[..8]);
+        assert_eq!(frames[0][8], 0);
+        assert_eq!(frames[0][9], payload[9]);
+        assert!(frames[0][10..].iter().all(|&b| b == 0));
+
+        assert_eq!(frames[1][0], payload[11]);
+        assert_eq!(frames[1][1], payload[8]);
+        assert_eq!(frames[1][3], payload[10]);
+        assert_eq!(frames[1][8], 0);
+        assert!(frames[1][10..].iter().all(|&b| b == 0));
+
+        assert_eq!(frames[2][..40], payload[18..58]);
+        assert_eq!(frames[2][40], 0);
+        assert_eq!(frames[2][41], payload[59]);
+
+        assert_eq!(frames[3][0], payload[61]);
+        assert_eq!(frames[3][1], payload[58]);
+        assert_eq!(frames[3][3], payload[60]);
+
+        for chunk in [1, 7, 100] {
+            let mut demuxer = DssSpStreamDemuxer::new(2, true);
+            assert_eq!(collect_frames(&mut demuxer, &data, chunk), frames);
+        }
+    }
+
+    #[test]
+    fn test_dss_codec_byte_selects_variable_rate_walk() {
+        let payload = vr_payload();
+        let (fixed, _) = demux_dss(&vr_file(&payload, 0, 3, 4, 0)).unwrap();
+        let (variable, _) = demux_dss(&vr_file(&payload, 0, 3, 4, 1)).unwrap();
+        assert_eq!(fixed.len(), 4);
+        assert_eq!(fixed[0][..40], payload[..40]);
+        assert_ne!(fixed, variable);
+    }
+
+    #[test]
+    fn test_dss_variable_rate_cut_frame_is_dropped() {
+        let data = vr_file(&vr_payload(), 0, 3, 4, 1);
+        for (cut, whole) in [(1, 0), (5, 0), (15, 1), (19, 2), (50, 2), (90, 3)] {
+            let end = PAYLOAD + cut;
+            let (frames, total) = demux_dss(&data[..end]).unwrap();
+            assert_eq!(total, whole, "cut at {cut}");
+
+            let mut demuxer = DssSpStreamDemuxer::new(2, true);
+            let _ = demuxer.push(&data[..end]).unwrap();
+            assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
+
+            let mut demuxer = DssSpStreamDemuxer::new(2, true);
+            let mut lenient = demuxer.push(&data[..end]).unwrap();
+            lenient.extend(demuxer.finish_lenient().unwrap());
+            assert_eq!(lenient, frames, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn test_dss_variable_rate_unknown_swap_byte_reads_long_frame() {
+        let payload: Vec<u8> = (1..=60).collect();
+        let data = vr_file(&payload, 1, 2, 2, 1);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(frames[0][..8], payload[40..48]);
+        assert_eq!(frames[0][9], payload[49]);
+        assert!(frames[0][10..].iter().all(|&b| b == 0));
+
+        let mut demuxer = DssSpStreamDemuxer::new(2, true);
+        assert_eq!(collect_frames(&mut demuxer, &data, 3), frames);
     }
 }
