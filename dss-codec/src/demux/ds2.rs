@@ -4,7 +4,7 @@
 /// QP mode (6): 56-byte frames, read from each block's anchor and across
 /// block boundaries.
 /// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
-use crate::demux::dss::dss_sp_frames;
+use crate::demux::dss::{block_frames, dss_sp_frames};
 use crate::demux::{check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
 
@@ -92,14 +92,6 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             total_frames: packets.len(),
             packets,
         })
-    }
-}
-
-fn block_frames(hdr: &[u8]) -> usize {
-    if hdr[2] != 0 || hdr[5] == 0xff {
-        hdr[2] as usize
-    } else {
-        hdr[5] as usize
     }
 }
 

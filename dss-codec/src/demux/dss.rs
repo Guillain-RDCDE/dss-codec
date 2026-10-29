@@ -12,6 +12,14 @@ const DSS_SP_FRAME_SIZE: usize = 42;
 const DSS_SP_SHORT_FRAME_SIZE: usize = 9;
 const DSS_SP_PACKET_BUF: usize = 48;
 
+pub(crate) fn block_frames(header: &[u8]) -> usize {
+    if header[2] != 0 || header[5] == 0xff {
+        header[2] as usize
+    } else {
+        header[5] as usize
+    }
+}
+
 pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     if data.len() < 4 || data[1..4] != *b"dss" || (data[0] != 2 && data[0] != 3) {
         return Err(DecodeError::NotDss(std::path::PathBuf::from("<bytes>")));
@@ -183,7 +191,7 @@ impl DssSpWalker {
             }
             let cont = cont as usize;
 
-            self.frames_left = header[2] as usize;
+            self.frames_left = block_frames(header);
             if self.frames_left == 0 {
                 continue;
             }
@@ -340,6 +348,12 @@ mod tests {
         data
     }
 
+    fn pause_block(byte1: u8, byte5: u8, payload_pattern: u8) -> [u8; DSS_BLOCK_SIZE] {
+        let mut block = make_dss_block(0, byte1, 0, payload_pattern);
+        block[5] = byte5;
+        block
+    }
+
     fn collect_frames(
         demuxer: &mut DssSpStreamDemuxer,
         data: &[u8],
@@ -487,6 +501,74 @@ mod tests {
         assert_eq!(total, 12);
         assert_eq!(frames.len(), 12);
         assert!(frames.iter().all(|f| f.len() == DSS_SP_FRAME_SIZE));
+    }
+
+    #[test]
+    fn test_dss_demux_pause_block_frames_from_byte5() {
+        let data = make_dss_file(&[pause_block(3, 3, 0x20)]);
+        let mut counted = data.clone();
+        counted[2 * DSS_BLOCK_SIZE + 2] = 3;
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(frames[0][..40], data[2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE..][..40]);
+        assert_eq!(frames, demux_dss(&counted).unwrap().0);
+    }
+
+    #[test]
+    fn test_dss_stream_demux_pause_block_matches_batch() {
+        let data = make_dss_file(&[
+            make_dss_block(0, 3, 11, 0x10),
+            pause_block(3, 2, 0x50),
+            make_dss_block(0, 3, 1, 0x90),
+        ]);
+
+        let (expected, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 14);
+        assert_eq!(expected[11][..40], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE..][..40]);
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
+        assert_eq!(collect_frames(&mut demuxer, &data, 37), expected);
+    }
+
+    #[test]
+    fn test_dss_demux_byte5_ff_leaves_block_empty() {
+        let data = make_dss_file(&[pause_block(3, 0xff, 0x20), make_dss_block(0, 3, 2, 0x60)]);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(frames[0][..40], data[3 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE..][..40]);
+    }
+
+    #[test]
+    fn test_dss_demux_byte2_overrides_byte5() {
+        let mut block = make_dss_block(0, 3, 1, 0x20);
+        block[5] = 7;
+        let data = make_dss_file(&[block]);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn test_dss_demux_pause_block_count_past_end_of_file() {
+        let data = make_dss_file(&[pause_block(3, 14, 0x20)]);
+
+        let (frames, total) = demux_dss(&data).unwrap();
+        assert_eq!(total, 12);
+
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
+        assert_eq!(collect_frames(&mut demuxer, &data, 37), frames);
+
+        let end = data.len() - 100;
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
+        let _ = demuxer.push(&data[..end]).unwrap();
+        assert!(matches!(demuxer.finish(), Err(DecodeError::Truncated(_))));
+
+        let mut demuxer = DssSpStreamDemuxer::new(2, false);
+        let mut lenient = demuxer.push(&data[..end]).unwrap();
+        lenient.extend(demuxer.finish_lenient().unwrap());
+        assert_eq!(lenient, demux_dss(&data[..end]).unwrap().0);
     }
 
     #[test]
