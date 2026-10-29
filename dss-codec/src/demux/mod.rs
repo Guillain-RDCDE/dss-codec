@@ -67,7 +67,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         return Some(AudioFormat::DssSp);
     }
     if data[..4] == *b"\x03enc" && data.len() >= 0x600 + DS2_BLOCK_HEADER_SIZE {
-        let format_type = crate::demux::dss::header_format(&data[0x600..]);
+        let format_type = detect_ds2_format_type(data, audio_start(data, 0x600));
         return Some(match format_type {
             7 => AudioFormat::Ds2Qp7,
             6 => AudioFormat::Ds2Qp,
@@ -136,6 +136,7 @@ mod tests {
     fn make_ds2_like_file(magic: [u8; 4], mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 0x200];
         data[..4].copy_from_slice(&magic);
+        data[0x600 + 2] = 1;
         data[0x600 + 3] = 0xff;
         data[0x600 + 4] = mode;
         data

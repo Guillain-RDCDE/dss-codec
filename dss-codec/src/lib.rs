@@ -216,6 +216,7 @@ mod inspection_tests {
         data[..4].copy_from_slice(&ENCRYPTED_MAGIC);
         data[DECRYPT_DESCRIPTOR_OFFSET..DECRYPT_DESCRIPTOR_OFFSET + 2]
             .copy_from_slice(&mode.to_le_bytes());
+        data[0x602] = 1;
         data[0x603] = 0xff;
         data[0x604] = format_type;
         data
@@ -241,5 +242,36 @@ mod inspection_tests {
             inspect_bytes(&encrypted_ds2(99, 0)).unwrap().encryption,
             EncryptionInfo::EncryptedUnknown(99)
         );
+    }
+
+    #[test]
+    fn inspect_bytes_reads_an_encrypted_file_as_its_plain_twin() {
+        for (first, byte3, frames, format) in [
+            (2u8, 0xffu8, 0u8, AudioFormat::Ds2Qp),
+            (4, 0xff, 0, AudioFormat::Ds2Qp),
+            (0, 0xff, 0, AudioFormat::Ds2Qp),
+            (3, 0xff, 1, AudioFormat::Ds2Qp),
+            (8, 0xff, 1, AudioFormat::Ds2Qp),
+            (7, 0, 1, AudioFormat::Ds2Qp),
+            (2, 0, 1, AudioFormat::Ds2Qp),
+        ] {
+            let mut data = encrypted_ds2(1, first);
+            data[0x602] = frames;
+            data[0x603] = byte3;
+            data.resize(0xa00, 0);
+            data[0x802] = 1;
+            data[0x803] = 0xff;
+            data[0x804] = 6;
+            let mut plain = data.clone();
+            plain[..4].copy_from_slice(b"\x03ds2");
+            assert_eq!(
+                detect_format(&plain),
+                Some(format),
+                "plain, {first} then QP"
+            );
+            let info = inspect_bytes(&data).unwrap();
+            assert_eq!(info.format, format, "{first} then QP");
+            assert_eq!(info.native_rate(), 16000);
+        }
     }
 }
