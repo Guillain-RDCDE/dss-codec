@@ -6,7 +6,7 @@ use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
 use crate::demux::ds2::{demux_ds2, DemuxedDs2, Ds2QpStreamDemuxer, Ds2SpStreamDemuxer};
 use crate::demux::dss::DssSpStreamDemuxer;
 use crate::demux::grundig::GrundigSpStreamDemuxer;
-use crate::demux::{detect_format, AudioFormat};
+use crate::demux::{detect_format, ds2_header_size, AudioFormat};
 use crate::error::{DecodeError, Result};
 
 pub struct StreamingDecoder {
@@ -99,9 +99,7 @@ impl StreamingDecoder {
                 return Ok(samples);
             }
 
-            return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
-            {
+            return if ds2_header_size(&self.prebuffer).is_some() {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
                 && self.prebuffer[1..4] == *b"dss"
@@ -139,9 +137,7 @@ impl StreamingDecoder {
                 return Ok(samples);
             }
 
-            return if self.prebuffer.len() >= 4
-                && matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2")
-            {
+            return if ds2_header_size(&self.prebuffer).is_some() {
                 Err(DecodeError::Truncated("DS2 header".to_string()))
             } else if self.prebuffer.len() >= 4
                 && self.prebuffer[1..4] == *b"dss"
@@ -177,8 +173,7 @@ impl StreamingDecoder {
         if self.prebuffer.len() >= 4 {
             let is_dss_prefix = self.prebuffer[1..4] == *b"dss"
                 && (self.prebuffer[0] == 2 || self.prebuffer[0] == 3 || self.prebuffer[0] == 6);
-            let is_ds2_prefix =
-                matches!(&self.prebuffer[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2");
+            let is_ds2_prefix = ds2_header_size(&self.prebuffer).is_some();
             if !is_dss_prefix && !is_ds2_prefix {
                 return Err(DecodeError::UnsupportedFormat(
                     self.prebuffer.first().copied().unwrap_or(0),
@@ -198,7 +193,8 @@ impl StreamingDecoder {
                 self.decoder = Some(ActiveDecoder::Dss(DssSpDecoder::new()));
             }
             AudioFormat::Ds2Sp => {
-                self.demuxer = Some(ActiveDemuxer::Ds2Sp(Ds2SpStreamDemuxer::new()));
+                let header_size = ds2_header_size(&self.prebuffer).unwrap_or(3 * 512);
+                self.demuxer = Some(ActiveDemuxer::Ds2Sp(Ds2SpStreamDemuxer::new(header_size)));
                 self.decoder = Some(ActiveDecoder::Ds2Sp(Ds2SpDecoder::new()));
             }
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => {
@@ -447,7 +443,7 @@ impl Default for StreamingDecoder {
 }
 
 fn is_plain_prefix(bytes: &[u8]) -> bool {
-    matches!(bytes.get(..4), Some(b"\x03ds2") | Some(b"\x01ds2") | Some(b"\x07ds2"))
+    ds2_header_size(bytes).is_some()
         || (bytes.len() >= 4 && bytes[1..4] == *b"dss" && (bytes[0] == 2 || bytes[0] == 3 || bytes[0] == 6))
 }
 
@@ -488,6 +484,63 @@ mod tests {
 
         let err = decoder.finish().unwrap_err();
         assert!(matches!(err, DecodeError::Truncated(_)));
+    }
+
+    #[test]
+    fn test_streaming_decoder_two_block_header_detects() {
+        let mut data = vec![0u8; 1024 + 512];
+        data[..4].copy_from_slice(b"\x02ds2");
+        data[1024 + 2] = 1;
+        data[1024 + 4] = 6;
+        let mut decoder = StreamingDecoder::new();
+        let _ = decoder.push(&data[..1024 + 4]).unwrap();
+        assert_eq!(decoder.format(), None);
+        let _ = decoder.push(&data[1024 + 4..]).unwrap();
+        assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
+        let tail = decoder.finish().unwrap();
+        assert_eq!(tail.len(), 256);
+    }
+
+    #[test]
+    fn test_streaming_decoder_one_block_header_for_first_byte_one() {
+        let mut data = vec![0u8; 512 + 512];
+        data[..4].copy_from_slice(b"\x01ds2");
+        data[512 + 2] = 1;
+        data[512 + 3] = 0xff;
+        data[512 + 4] = 6;
+        let mut decoder = StreamingDecoder::new();
+        let _ = decoder.push(&data[..0x203]).unwrap();
+        assert_eq!(decoder.format(), None);
+        let _ = decoder.push(&data[0x203..]).unwrap();
+        assert_eq!(decoder.format(), Some(AudioFormat::Ds2Qp));
+        let tail = decoder.finish().unwrap();
+        assert_eq!(tail.len(), 256);
+    }
+
+    #[test]
+    fn test_streaming_decoder_truncated_long_header_on_finish() {
+        let mut decoder = StreamingDecoder::new();
+        let _ = decoder.push(&[0x08, b'd', b's', b'2', 0, 0]).unwrap();
+        let err = decoder.finish().unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated(_)));
+        let mut decoder = StreamingDecoder::new();
+        let _ = decoder.push(&[0x11, b'd', b's', b'2', 0, 0]).unwrap();
+        let err = decoder.finish().unwrap_err();
+        assert!(matches!(err, DecodeError::Truncated(_)));
+    }
+
+    #[test]
+    fn test_streaming_decoder_rejects_header_byte_out_of_range() {
+        let mut decoder = StreamingDecoder::new();
+        let err = decoder.push(b"\x00ds2").unwrap_err();
+        assert!(matches!(err, DecodeError::UnsupportedFormat(0)));
+    }
+
+    #[test]
+    fn decrypt_streamer_passes_long_header_ds2_through() {
+        let mut decryptor = DecryptStreamer::new(None);
+        let plain = decryptor.push(b"\x08ds2rest").unwrap();
+        assert_eq!(plain, b"\x08ds2rest");
     }
 
     #[test]

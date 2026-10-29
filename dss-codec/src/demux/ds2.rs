@@ -3,9 +3,9 @@
 /// SP mode (0-1): byte-swap demuxing, returns list of 42-byte packets.
 /// QP mode (6): segmented continuous bitstream.
 /// QP7 mode (7): segmented 12/56-byte byte-aligned records.
+use crate::demux::ds2_header_size;
 use crate::error::{DecodeError, Result};
 
-const DS2_HEADER_SIZE: usize = 0x600;
 const DS2_BLOCK_SIZE: usize = 512;
 const DS2_BLOCK_HEADER_SIZE: usize = 6;
 const DSS_SP_PACKET_SIZE: usize = 42;
@@ -27,64 +27,6 @@ pub struct Ds2Qp7Segment {
     pub reset_before: bool,
 }
 
-pub(crate) fn is_ds2_audio_block_header(block_header: &[u8]) -> bool {
-    if block_header.len() < DS2_BLOCK_HEADER_SIZE {
-        return false;
-    }
-    let fc = block_header[2];
-    let fmt = block_header[4];
-    block_header[0] == 0x0f
-        && block_header[3] == 0xff
-        && block_header[5] == 0xff
-        && fc > 0
-        && matches!(fmt, 0 | 1 | 2 | 3 | 6 | 7)
-}
-
-pub(crate) fn detect_ds2_audio_start(data: &[u8]) -> usize {
-    if data.first().copied() != Some(0x07) {
-        return DS2_HEADER_SIZE;
-    }
-
-    let scan_end = data
-        .len()
-        .saturating_sub(DS2_BLOCK_HEADER_SIZE)
-        .min(0x10000);
-    let mut best_start = None;
-    let mut best_score = 0usize;
-
-    let mut offset = DS2_BLOCK_SIZE;
-    while offset <= scan_end {
-        if !is_ds2_audio_block_header(&data[offset..offset + DS2_BLOCK_HEADER_SIZE]) {
-            offset += DS2_BLOCK_SIZE;
-            continue;
-        }
-
-        let mut valid = 0usize;
-        for i in 0..16 {
-            let block_start = offset + i * DS2_BLOCK_SIZE;
-            if block_start + DS2_BLOCK_HEADER_SIZE > data.len() {
-                break;
-            }
-            if !is_ds2_audio_block_header(&data[block_start..block_start + DS2_BLOCK_HEADER_SIZE]) {
-                break;
-            }
-            valid += 1;
-        }
-
-        if valid >= 4 {
-            return offset;
-        }
-        if valid > best_score {
-            best_start = Some(offset);
-            best_score = valid;
-        }
-
-        offset += DS2_BLOCK_SIZE;
-    }
-
-    best_start.unwrap_or(0x1000)
-}
-
 pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
     let num_blocks = data.len().saturating_sub(header_size) / DS2_BLOCK_SIZE;
     for bi in 0..num_blocks {
@@ -104,11 +46,8 @@ pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
 /// For SP: frame_data is a Vec<Vec<u8>> of packets.
 /// For QP/QP7: frame data is segmented to preserve state resets at cut points.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
-    if data.len() < 4 || !matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") {
-        return Err(DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")));
-    }
-
-    let header_size = detect_ds2_audio_start(data);
+    let header_size = ds2_header_size(data)
+        .ok_or_else(|| DecodeError::NotDs2(std::path::PathBuf::from("<bytes>")))?;
     let num_blocks = data.len().saturating_sub(header_size) / DS2_BLOCK_SIZE;
     let format_type = detect_ds2_format_type(data, header_size);
 
@@ -319,6 +258,7 @@ pub enum DemuxedDs2 {
 }
 
 pub(crate) struct Ds2SpStreamDemuxer {
+    header_size: usize,
     header_complete: bool,
     block_buf: Vec<u8>,
     stream_buf: Vec<u8>,
@@ -329,8 +269,9 @@ pub(crate) struct Ds2SpStreamDemuxer {
 }
 
 impl Ds2SpStreamDemuxer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(header_size: usize) -> Self {
         Self {
+            header_size,
             header_complete: false,
             block_buf: Vec::new(),
             stream_buf: Vec::new(),
@@ -346,11 +287,11 @@ impl Ds2SpStreamDemuxer {
         let mut offset = 0;
 
         if !self.header_complete {
-            let needed = DS2_HEADER_SIZE.saturating_sub(self.block_buf.len());
+            let needed = self.header_size.saturating_sub(self.block_buf.len());
             let take = needed.min(data.len());
             self.block_buf.extend_from_slice(&data[..take]);
             offset += take;
-            if self.block_buf.len() < DS2_HEADER_SIZE {
+            if self.block_buf.len() < self.header_size {
                 return Ok(frames);
             }
             self.header_complete = true;
@@ -505,8 +446,19 @@ mod tests {
     use super::*;
 
     fn make_ds2_file(mode: u8, frame_count: u8, payload_pattern: u8) -> Vec<u8> {
-        let mut data = vec![0u8; DS2_HEADER_SIZE];
-        data[..4].copy_from_slice(b"\x03ds2");
+        make_ds2_file_with_header(3, mode, frame_count, payload_pattern)
+    }
+
+    fn make_ds2_file_with_header(
+        first_byte: u8,
+        mode: u8,
+        frame_count: u8,
+        payload_pattern: u8,
+    ) -> Vec<u8> {
+        let header_blocks = if first_byte == 1 { 3 } else { first_byte as usize };
+        let mut data = vec![0u8; header_blocks * DS2_BLOCK_SIZE];
+        data[0] = first_byte;
+        data[1..4].copy_from_slice(b"ds2");
 
         let mut block = [0u8; DS2_BLOCK_SIZE];
         block[2] = frame_count;
@@ -527,7 +479,7 @@ mod tests {
             _ => panic!("expected DS2 SP packets"),
         };
 
-        let mut demuxer = Ds2SpStreamDemuxer::new();
+        let mut demuxer = Ds2SpStreamDemuxer::new(3 * DS2_BLOCK_SIZE);
         let mut actual = Vec::new();
         for chunk in data.chunks(137) {
             actual.extend(demuxer.push(chunk).unwrap());
@@ -580,6 +532,62 @@ mod tests {
         actual.extend(demuxer.finish().unwrap());
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_ds2_qp_demux_two_block_header() {
+        let data = make_ds2_file_with_header(2, 6, 3, 0x40);
+        let short = make_ds2_file(6, 3, 0x40);
+        let frames = |demuxed: DemuxedDs2| match demuxed {
+            DemuxedDs2::QpSegments {
+                segments,
+                total_frames,
+            } => (segments, total_frames),
+            _ => panic!("expected DS2 QP stream"),
+        };
+        assert_eq!(frames(demux_ds2(&data).unwrap()), frames(demux_ds2(&short).unwrap()));
+    }
+
+    #[test]
+    fn test_ds2_sp_stream_demux_two_block_header() {
+        let data = make_ds2_file_with_header(2, 0, 4, 0x10);
+        let expected = match demux_ds2(&data).unwrap() {
+            DemuxedDs2::Sp { packets, .. } => packets,
+            _ => panic!("expected DS2 SP packets"),
+        };
+        assert_eq!(expected.len(), 4);
+
+        let mut demuxer = Ds2SpStreamDemuxer::new(2 * DS2_BLOCK_SIZE);
+        let mut actual = Vec::new();
+        for chunk in data.chunks(137) {
+            actual.extend(demuxer.push(chunk).unwrap());
+        }
+        actual.extend(demuxer.finish().unwrap());
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_ds2_demux_rejects_bad_header_byte() {
+        let mut data = make_ds2_file(6, 3, 0x40);
+        data[0] = 0;
+        assert!(matches!(demux_ds2(&data), Err(DecodeError::NotDs2(_))));
+    }
+
+    #[test]
+    fn test_ds2_qp_demux_one_block_header() {
+        let mut long = make_ds2_file(6, 3, 0x40);
+        long[3 * DS2_BLOCK_SIZE + 3] = 0xff;
+        let mut data = long[..DS2_BLOCK_SIZE].to_vec();
+        data[0] = 1;
+        data.extend_from_slice(&long[3 * DS2_BLOCK_SIZE..]);
+        let frames = |demuxed: DemuxedDs2| match demuxed {
+            DemuxedDs2::QpSegments {
+                segments,
+                total_frames,
+            } => (segments, total_frames),
+            _ => panic!("expected DS2 QP stream"),
+        };
+        assert_eq!(frames(demux_ds2(&data).unwrap()), frames(demux_ds2(&long).unwrap()));
     }
 
     #[test]

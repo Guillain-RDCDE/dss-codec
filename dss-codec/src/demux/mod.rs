@@ -2,7 +2,7 @@ pub mod dss;
 pub mod ds2;
 pub mod grundig;
 
-use crate::demux::ds2::{detect_ds2_audio_start, detect_ds2_format_type};
+use crate::demux::ds2::detect_ds2_format_type;
 
 /// Detected audio format
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +73,7 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
             _ => AudioFormat::Ds2Sp,
         });
     }
-    if matches!(&data[..4], b"\x03ds2" | b"\x01ds2" | b"\x07ds2") && data.len() > 0x604 {
-        let header_size = detect_ds2_audio_start(data);
+    if let Some(header_size) = ds2_header_size(data) {
         if data.len() <= header_size + 4 {
             return None;
         }
@@ -86,6 +85,16 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
         });
     }
     None
+}
+
+pub(crate) fn ds2_header_size(data: &[u8]) -> Option<usize> {
+    if data.len() < 4 || data[1..4] != *b"ds2" || data[0] == 0 {
+        return None;
+    }
+    if data[0] == 1 && data.get(0x203) != Some(&0xff) {
+        return Some(3 * 512);
+    }
+    Some(usize::from(data[0]) * 512)
 }
 
 #[cfg(test)]
@@ -115,5 +124,91 @@ mod tests {
     fn detect_format_recognizes_encrypted_ds2_sp() {
         let data = make_ds2_like_file(*b"\x03enc", 0);
         assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Sp));
+    }
+
+    fn make_ds2_with_header_blocks(first_byte: u8, header_blocks: usize, mode: u8) -> Vec<u8> {
+        let header_size = header_blocks * 512;
+        let mut data = vec![0u8; header_size + 512];
+        data[0] = first_byte;
+        data[1..4].copy_from_slice(b"ds2");
+        data[header_size + 2] = 1;
+        data[header_size + 4] = mode;
+        data
+    }
+
+    #[test]
+    fn ds2_header_size_follows_first_byte() {
+        assert_eq!(ds2_header_size(b"\x01ds2"), Some(1536));
+        assert_eq!(ds2_header_size(b"\x02ds2"), Some(1024));
+        assert_eq!(ds2_header_size(b"\x03ds2"), Some(1536));
+        assert_eq!(ds2_header_size(b"\x07ds2"), Some(3584));
+        assert_eq!(ds2_header_size(b"\x08ds2"), Some(4096));
+        assert_eq!(ds2_header_size(b"\x10ds2"), Some(8192));
+        assert_eq!(ds2_header_size(b"\x11ds2"), Some(8704));
+        assert_eq!(ds2_header_size(b"\xffds2"), Some(130560));
+    }
+
+    #[test]
+    fn ds2_header_size_reads_one_block_when_next_block_is_audio() {
+        let mut data = make_ds2_with_header_blocks(1, 1, 6);
+        assert_eq!(ds2_header_size(&data), Some(1536));
+        assert_eq!(detect_format(&data), None);
+        data[0x203] = 0xff;
+        assert_eq!(ds2_header_size(&data[..0x203]), Some(1536));
+        assert_eq!(ds2_header_size(&data), Some(512));
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn ds2_header_size_rejects_other_prefixes() {
+        assert_eq!(ds2_header_size(b"\x00ds2"), None);
+        assert_eq!(ds2_header_size(b"\x03dss"), None);
+        assert_eq!(ds2_header_size(b"\x03enc"), None);
+        assert_eq!(ds2_header_size(b"\x03ds"), None);
+        assert_eq!(ds2_header_size(b""), None);
+    }
+
+    #[test]
+    fn detect_format_reads_mode_after_two_block_header() {
+        let data = make_ds2_with_header_blocks(2, 2, 6);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+        let data = make_ds2_with_header_blocks(2, 2, 7);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
+    }
+
+    #[test]
+    fn detect_format_reads_mode_after_eight_block_header() {
+        let data = make_ds2_with_header_blocks(8, 8, 6);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn detect_format_reads_three_block_header_for_first_byte_one() {
+        let data = make_ds2_with_header_blocks(1, 3, 7);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
+    }
+
+    #[test]
+    fn detect_format_waits_for_first_block_header() {
+        let data = make_ds2_with_header_blocks(8, 8, 6);
+        assert_eq!(detect_format(&data[..8 * 512 + 4]), None);
+        assert_eq!(detect_format(&data[..8 * 512]), None);
+        assert_eq!(detect_format(&data[..3 * 512 + 5]), None);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+    }
+
+    #[test]
+    fn detect_format_rejects_out_of_range_header_byte() {
+        let mut data = make_ds2_with_header_blocks(3, 3, 6);
+        data[0] = 0;
+        assert_eq!(detect_format(&data), None);
+    }
+
+    #[test]
+    fn detect_format_reads_mode_after_header_over_sixteen_blocks() {
+        let data = make_ds2_with_header_blocks(17, 17, 6);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp));
+        let data = make_ds2_with_header_blocks(255, 255, 7);
+        assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Qp7));
     }
 }
