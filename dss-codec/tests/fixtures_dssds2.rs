@@ -70,6 +70,15 @@ fn decode(name: &str, password: Option<&[u8]>) -> dss_codec::error::Result<Audio
     dss_codec::decode_to_buffer_with_password(&fixture(name), password)
 }
 
+/// A file that lost its header decodes to the same samples as its original.
+fn same_as_original(name: &str, original: &str) {
+    let lost = decode(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let whole = decode(original, None).unwrap_or_else(|e| panic!("{original}: {e}"));
+    assert_eq!(lost.native_rate, whole.native_rate, "{name}: rate");
+    assert_eq!(lost.format, whole.format, "{name}: format");
+    assert_eq!(pcm(&lost.samples), pcm(&whole.samples), "{name}: samples");
+}
+
 fn pcm(samples: &[f64]) -> Vec<u8> {
     samples
         .iter()
@@ -369,9 +378,7 @@ fn ds2_olympus_qp_header_copy() {
 
 #[test]
 fn ds2_olympus_qp_no_header() {
-    refuses("ds2/olympus-qp-no-header.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedFormat(15))
-    });
+    same_as_original("ds2/olympus-qp-no-header.ds2", "ds2/olympus-qp-annot.ds2");
 }
 
 #[test]
@@ -813,9 +820,7 @@ fn dss_olympus_format1_header_copy() {
 
 #[test]
 fn dss_olympus_format1_no_header() {
-    refuses("dss/olympus-format1-no-header.dss", |e| {
-        matches!(e, DecodeError::UnsupportedFormat(15))
-    });
+    same_as_original("dss/olympus-format1-no-header.dss", "dss/olympus-format1.dss");
 }
 
 #[test]

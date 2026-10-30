@@ -117,6 +117,58 @@ pub(crate) fn audio_start(data: &[u8], header_size: usize) -> usize {
     start
 }
 
+/// Blocks with frames that must agree before a file with no header is taken
+/// for DSS or DS2.
+const LOST_HEADER_BLOCKS: usize = 16;
+/// How far into a file with no header its first frames are looked for.
+/// Recorders can leave a long run of empty blocks in front of them.
+const LOST_HEADER_SCAN: usize = 4096;
+
+/// A DSS or DS2 file that lost its header starts straight at its audio
+/// blocks. With no magic to match, the blocks are the signature: byte 3 of a
+/// block header is 0xff, byte 4 gives a known block format and the anchor
+/// stays inside the block. Empty blocks, whose first four bytes are zero, are
+/// passed over: some recorders write a long run of them in front of the
+/// first frames, and a pause can leave a few more between them. Random bytes
+/// and other audio containers do not keep that up for sixteen blocks in a row.
+///
+/// Returns a blank header to put back in front of the blocks, chosen from
+/// the first block format: two blocks named "dss" for SP and LP, three named
+/// "ds2" for QP and QP7.
+pub(crate) fn lost_header(data: &[u8]) -> Option<Vec<u8>> {
+    let mut first = None;
+    let mut found = 0;
+    for block in data.chunks_exact(512).take(LOST_HEADER_SCAN) {
+        if block[3] != 0xff {
+            if block[..4] != [0, 0, 0, 0] {
+                return None;
+            }
+            continue;
+        }
+        let anchor = 2 * usize::from(block[1]) + 2 * usize::from(block[0] >> 7);
+        crate::demux::dss::part_format(block[4])?;
+        if anchor > 512 {
+            return None;
+        }
+        first.get_or_insert(block[4]);
+        found += 1;
+        if found == LOST_HEADER_BLOCKS {
+            break;
+        }
+    }
+    if found < LOST_HEADER_BLOCKS {
+        return None;
+    }
+    let (blocks, name): (usize, &[u8]) = match first? {
+        6 | 7 => (3, b"ds2"),
+        _ => (2, b"dss"),
+    };
+    let mut header = vec![0u8; blocks * 512];
+    header[0] = blocks as u8;
+    header[1..4].copy_from_slice(name);
+    Some(header)
+}
+
 pub(crate) fn sp_codec(data: &[u8]) -> Option<u8> {
     let header_size = dss_header_size(data).or_else(|| ds2_header_size(data))?;
     Some(detect_ds2_format_type(data, audio_start(data, header_size)))
@@ -132,6 +184,52 @@ pub(crate) fn check_sp_codec(codec: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocks(count: usize, format: u8) -> Vec<u8> {
+        let mut data = vec![0u8; count * 512];
+        for block in data.chunks_exact_mut(512) {
+            block[1] = 3;
+            block[2] = 1;
+            block[3] = 0xff;
+            block[4] = format;
+        }
+        data
+    }
+
+    #[test]
+    fn lost_header_names_the_container_from_the_block_format() {
+        for (format, prefix) in [(0u8, b"\x02dss"), (1, b"\x02dss"), (6, b"\x03ds2"), (7, b"\x03ds2")] {
+            let header = lost_header(&blocks(16, format)).expect("blocks with no header");
+            assert_eq!(&header[..4], prefix, "format {format}");
+            assert_eq!(header.len(), usize::from(prefix[0]) * 512);
+        }
+    }
+
+    #[test]
+    fn lost_header_wants_sixteen_blocks_with_frames() {
+        assert!(lost_header(&blocks(15, 0)).is_none());
+        let mut unknown = blocks(24, 0);
+        unknown[12 * 512 + 4] = 9;
+        assert!(lost_header(&unknown).is_none());
+        let mut broken = blocks(24, 6);
+        broken[10 * 512 + 3] = 0;
+        assert!(lost_header(&broken).is_none());
+        assert!(lost_header(&blocks(24, 9)).is_none());
+        assert!(lost_header(&vec![0u8; 24 * 512]).is_none());
+        assert!(lost_header(&vec![0xffu8; 24 * 512]).is_none());
+    }
+
+    #[test]
+    fn lost_header_passes_over_empty_blocks() {
+        let mut data = vec![0u8; 61 * 512];
+        for block in data.chunks_exact_mut(512) {
+            block[4] = 6;
+        }
+        data.extend(blocks(5, 6));
+        data.extend(vec![0u8; 2 * 512]);
+        data.extend(blocks(11, 6));
+        assert_eq!(&lost_header(&data).expect("empty blocks then QP")[..4], b"\x03ds2");
+    }
 
     fn make_ds2_like_file(magic: [u8; 4], mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 0x200];

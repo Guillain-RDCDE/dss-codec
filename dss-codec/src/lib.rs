@@ -136,6 +136,12 @@ pub fn decode_to_buffer(data: &[u8]) -> Result<AudioBuffer> {
 
 /// Decode raw file bytes to an AudioBuffer, optionally decrypting encrypted DS2 input first.
 pub fn decode_to_buffer_with_password(data: &[u8], password: Option<&[u8]>) -> Result<AudioBuffer> {
+    if detect_format(data).is_none() {
+        if let Some(mut restored) = crate::demux::lost_header(data) {
+            restored.extend_from_slice(data);
+            return decode_to_buffer_with_password(&restored, password);
+        }
+    }
     let mut decoder = DecryptingDecoderStreamer::new(password);
     let mut samples = decoder.push(data)?;
     samples.extend(decoder.finish_lenient()?);

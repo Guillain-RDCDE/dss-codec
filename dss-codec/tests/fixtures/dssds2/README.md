@@ -130,10 +130,12 @@ from FFmpeg built from the dssds2-v13 series:
   series decodes the index as it stands, so its decode differs. FFmpeg
   with the same clamp gives the md5 in the test.
 
-Both decoders refuse 4 files. olympus-format1-no-header.dss and
-olympus-qp-no-header.ds2 fail with UnsupportedFormat(15), and the two
-byte3-none files with UnsupportedCodec(255). Their tests check that
-error.
+FFmpeg refuses 4 files. olympus-format1-no-header.dss and
+olympus-qp-no-header.ds2 have no header; dss-codec puts a blank one back
+and decodes them to the same samples as olympus-format1.dss and
+olympus-qp-annot.ds2, which their tests check. Both decoders refuse the
+two byte3-none files with UnsupportedCodec(255), and their tests check
+that error.
 
 ## Regenerating a reference
 
