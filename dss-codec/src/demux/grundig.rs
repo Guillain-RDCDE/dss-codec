@@ -61,8 +61,18 @@ fn grundig_frames(audio: &[u8]) -> (Vec<Vec<u8>>, bool) {
         if blk.len() < HEADER_SIZE {
             break;
         }
-        let first = (blk[1] as usize * 16 + (blk[0] >> 4) as usize).saturating_sub(HEADER_SIZE * 8);
-        blocks.push((payload.len() * 8 + first, blk[2] as usize));
+        let mut first = blk[1] as isize * 16 + (blk[0] >> 4) as isize - (HEADER_SIZE * 8) as isize;
+        let mut count = blk[2] as usize;
+        if first < 0 && blk[0] & 0x80 != 0 && payload.is_empty() {
+            while first < 0 && count > 0 {
+                first += FRAME_BITS as isize;
+                count -= 1;
+            }
+        }
+        if first < 0 && (blk[0] & 0x80 == 0 || payload.is_empty()) {
+            first = 0;
+        }
+        blocks.push((((payload.len() * 8) as isize + first) as usize, count));
         payload.extend_from_slice(&blk[HEADER_SIZE..]);
     }
     let payload_bits = payload.len() / 2 * 16;
@@ -148,7 +158,11 @@ impl GrundigSpStreamDemuxer {
             .into_iter()
             .map(|frame| (0, frame))
             .collect();
-        let mut rest = DssSpStreamDemuxer::with_format(self.header_size + other * BLOCK_SIZE, 0);
+        let mut rest = DssSpStreamDemuxer::from_block(
+            self.header_size,
+            self.header_size + other * BLOCK_SIZE,
+            0,
+        );
         let mut more = rest.push(&self.buf)?;
         more.extend(if strict {
             rest.finish()?
@@ -382,13 +396,71 @@ mod tests {
 
     #[test]
     fn test_grundig_offset_into_header_starts_at_payload() {
-        for (b0, b1) in [(0xf0, 2), (0x00, 0), (0xf0, 1)] {
+        for (b0, b1) in [(0x70, 2), (0x00, 0), (0x70, 1)] {
             let data = block(b0, b1, 2, 1);
             let bits = payload_bits(&data);
 
             let (frames, total) = demux_grundig(&data).unwrap();
             assert_eq!(total, 2);
             assert_eq!(frames, frames_from(&bits, 2));
+        }
+    }
+
+    #[test]
+    fn test_grundig_swapped_start_before_the_payload() {
+        for (b0, b1, start) in [(0x80, 2, 8), (0xf0, 2, 1), (0xf0, 1, 17), (0x80, 0, 40)] {
+            let data = [block(0x00, 3, 0, 1), block(b0, b1, 2, 2)].concat();
+            let bits = payload_bits(&data);
+            let pos = 4048 - start;
+            let expected = vec![frame_at(&bits, pos), frame_at(&bits, pos + FRAME_BITS)];
+            assert_eq!(
+                demux_grundig(&data).unwrap(),
+                (expected.clone(), 2),
+                "{b0:x} {b1}"
+            );
+            let file = grundig_file(&data);
+            assert_eq!(stream_finish(&file, true).unwrap(), expected);
+
+            let alone = block(b0, b1, 2, 2);
+            let bits = payload_bits(&alone);
+            let expected = vec![frame_at(&bits, FRAME_BITS - start)];
+            assert_eq!(
+                demux_grundig(&alone).unwrap(),
+                (expected, 1),
+                "{b0:x} {b1} alone"
+            );
+        }
+    }
+
+    #[test]
+    fn test_swapped_frame_after_a_grundig_part_reads_the_block_in_front() {
+        let mut first = block(0x80, 3, 13, 5);
+        first[4] = 1;
+        let mut second = block(0x00, 17, 5, 6);
+        second[4] = 1;
+        let mut stream = first[HEADER_SIZE..].to_vec();
+        stream.extend_from_slice(&second[HEADER_SIZE..]);
+        let payload = BLOCK_SIZE - HEADER_SIZE;
+        for (count, kept) in [(2u8, 2), (13, 12)] {
+            let grundig = block(0x00, 3, count, 1);
+            let in_place = [grundig.clone(), first.clone(), second.clone()].concat();
+            let expected = stream_finish(&grundig_file(&in_place), false).unwrap();
+            assert_eq!(expected.len(), kept + 18);
+            for moved in [2usize, 4, 6] {
+                let (mut g, mut a, mut b) = (grundig.clone(), first.clone(), second.clone());
+                a[1] -= moved as u8 / 2;
+                b[1] -= moved as u8 / 2;
+                a[HEADER_SIZE..].copy_from_slice(&stream[moved..moved + payload]);
+                b[HEADER_SIZE..].fill(0);
+                b[HEADER_SIZE..BLOCK_SIZE - moved].copy_from_slice(&stream[moved + payload..]);
+                g[BLOCK_SIZE - moved..].copy_from_slice(&stream[..moved]);
+                let file = grundig_file(&[g, a, b].concat());
+                assert_eq!(
+                    stream_finish(&file, false).unwrap(),
+                    expected,
+                    "{count} frames, {moved} bytes"
+                );
+            }
         }
     }
 

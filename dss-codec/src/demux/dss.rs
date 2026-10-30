@@ -266,27 +266,42 @@ impl DssSpWalker {
             self.swap = header[0] & 0x80 != 0;
             let mut cont =
                 2 * header[1] as isize + 2 * self.swap as isize - DSS_BLOCK_HEADER_SIZE as isize;
-            if cont < 0 || cont > (DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE) as isize {
+            if (cont < 0 && !self.swap) || cont > (DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE) as isize
+            {
                 cont = 0;
             }
-            let cont = cont as usize;
 
             self.frames_left = block_frames(header);
             if self.frames_left == 0 {
                 continue;
             }
 
+            let payload = self.block_pos + DSS_BLOCK_HEADER_SIZE;
+            self.pos = if cont < 0 {
+                self.block_pos - cont.unsigned_abs()
+            } else {
+                payload + cont as usize
+            };
             if self.swap {
-                let mut at = self.block_pos + cont - 2;
+                let mut at = self.block_pos as isize + cont - 2;
                 if cont >= 2 {
-                    at += DSS_BLOCK_HEADER_SIZE;
+                    at += DSS_BLOCK_HEADER_SIZE as isize;
                 }
-                if at >= self.header_size + DSS_BLOCK_HEADER_SIZE {
-                    self.swap_byte = Some(src.byte_or_zero(at)?);
+                if at >= (self.header_size + DSS_BLOCK_HEADER_SIZE) as isize {
+                    self.swap_byte = Some(src.byte_or_zero(at as usize)?);
+                } else if cont < 0 {
+                    let mut bits = 8 * (cont - 1);
+                    while bits < 0 && self.frames_left > 0 {
+                        bits += 8 * (DSS_SP_FRAME_SIZE as isize - 1);
+                        self.frames_left -= 1;
+                    }
+                    if self.frames_left == 0 {
+                        continue;
+                    }
+                    self.swap = false;
+                    self.pos = payload + bits as usize / 8;
                 }
             }
-
-            self.pos = self.block_pos + DSS_BLOCK_HEADER_SIZE + cont;
             return Ok(());
         }
     }
@@ -458,6 +473,13 @@ impl DssSpStreamDemuxer {
             buf: Vec::new(),
             base: 0,
         }
+    }
+
+    pub(crate) fn from_block(header_size: usize, start: usize, format: u8) -> Self {
+        let mut demuxer = Self::with_format(header_size, format);
+        demuxer.walker.block_pos = start - DSS_BLOCK_SIZE;
+        demuxer.walker.pos = start;
+        demuxer
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Result<TaggedFrames> {
@@ -667,6 +689,49 @@ mod tests {
 
         let mut demuxer = DssSpStreamDemuxer::new(2, false);
         assert_eq!(collect_frames(&mut demuxer, &data, 33), frames);
+    }
+
+    #[test]
+    fn test_dss_swapped_frame_starts_before_the_payload() {
+        let first = make_dss_block(1, 3, 13, 0x40);
+        let second = make_dss_block(0, 17, 5, 0x90);
+        let (expected, total) = demux_dss(&make_dss_file(&[first, second])).unwrap();
+        assert_eq!((expected.len(), total), (18, 18));
+        let mut stream = first[DSS_BLOCK_HEADER_SIZE..].to_vec();
+        stream.extend_from_slice(&second[DSS_BLOCK_HEADER_SIZE..]);
+        let payload = DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE;
+        for moved in [2usize, 4, 6] {
+            let (mut a, mut b) = (first, second);
+            a[1] -= moved as u8 / 2;
+            b[1] -= moved as u8 / 2;
+            a[DSS_BLOCK_HEADER_SIZE..].copy_from_slice(&stream[moved..moved + payload]);
+            b[DSS_BLOCK_HEADER_SIZE..].fill(0);
+            b[DSS_BLOCK_HEADER_SIZE..DSS_BLOCK_SIZE - moved]
+                .copy_from_slice(&stream[moved + payload..]);
+            let mut empty = make_dss_block(0, 3, 0, 0);
+            empty[DSS_BLOCK_HEADER_SIZE..].fill(0);
+            empty[DSS_BLOCK_SIZE - moved..].copy_from_slice(&stream[..moved]);
+
+            let data = make_dss_file(&[empty, a, b]);
+            assert_eq!(
+                demux_dss(&data).unwrap(),
+                (expected.clone(), 18),
+                "{moved} bytes"
+            );
+            for chunk in [1, 7] {
+                let mut demuxer = DssSpStreamDemuxer::new(2, false);
+                assert_eq!(collect_frames(&mut demuxer, &data, chunk), expected);
+            }
+
+            let alone = make_dss_file(&[a, b]);
+            assert_eq!(
+                demux_dss(&alone).unwrap(),
+                (expected[1..].to_vec(), 17),
+                "{moved} bytes, first block"
+            );
+            let mut demuxer = DssSpStreamDemuxer::new(2, false);
+            assert_eq!(collect_frames(&mut demuxer, &alone, 7), expected[1..]);
+        }
     }
 
     #[test]
