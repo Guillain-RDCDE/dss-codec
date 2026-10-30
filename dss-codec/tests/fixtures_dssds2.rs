@@ -1,5 +1,6 @@
 use dss_codec::demux::AudioFormat;
 use dss_codec::error::DecodeError;
+use dss_codec::streaming::StreamingDecoder;
 use dss_codec::AudioBuffer;
 
 const K: [u32; 64] = [
@@ -131,6 +132,35 @@ fn refuses(name: &str, expected: fn(&DecodeError) -> bool) {
     }
 }
 
+/// The files with LP blocks decode to the same parts when they arrive in
+/// pieces.
+#[test]
+fn lp_files_stream_like_a_whole_file() {
+    for name in [
+        "ds2/olympus-lp-annot.ds2",
+        "ds2/olympus-lp-empty64.ds2",
+        "ds2/olympus-lp-format4.ds2",
+        "ds2/olympus-lp.ds2",
+        "ds2/olympus-qp7-lp-empty109.ds2",
+        "ds2/olympus-qp7-lp.ds2",
+        "dss/olympus-lp-format-sp.dss",
+        "dss/olympus-lp-format4.dss",
+    ] {
+        let data = fixture(name);
+        let whole = decode(name, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+        for chunk in [7, 515] {
+            let mut decoder = StreamingDecoder::new();
+            let mut samples = Vec::new();
+            for piece in data.chunks(chunk) {
+                samples.extend(decoder.push(piece).unwrap());
+            }
+            samples.extend(decoder.finish().unwrap());
+            assert_eq!(samples, whole.samples, "{name}: samples, chunk {chunk}");
+            assert_eq!(decoder.parts(), whole.parts, "{name}: parts, chunk {chunk}");
+        }
+    }
+}
+
 #[test]
 fn md5_matches_rfc_1321() {
     for (text, digest) in [
@@ -193,30 +223,62 @@ fn ds2_olympus_format1() {
 
 #[test]
 fn ds2_olympus_lp_annot() {
-    refuses("ds2/olympus-lp-annot.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "ds2/olympus-lp-annot.ds2",
+        None,
+        &[(
+            8000,
+            80400,
+            AudioFormat::Ds2Lp,
+            2,
+            "db6ef8b6e0ea569f10cf51a52f08cbc2",
+        )],
+    );
 }
 
 #[test]
 fn ds2_olympus_lp_empty64() {
-    refuses("ds2/olympus-lp-empty64.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "ds2/olympus-lp-empty64.ds2",
+        None,
+        &[(
+            8000,
+            80400,
+            AudioFormat::Ds2Lp,
+            2,
+            "db6ef8b6e0ea569f10cf51a52f08cbc2",
+        )],
+    );
 }
 
 #[test]
 fn ds2_olympus_lp_format4() {
-    refuses("ds2/olympus-lp-format4.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(4))
-    });
+    decodes(
+        "ds2/olympus-lp-format4.ds2",
+        None,
+        &[(
+            8000,
+            24000,
+            AudioFormat::Ds2Lp,
+            4,
+            "cb0ce2d909492c16a818557b1dcb29ba",
+        )],
+    );
 }
 
 #[test]
 fn ds2_olympus_lp() {
-    refuses("ds2/olympus-lp.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "ds2/olympus-lp.ds2",
+        None,
+        &[(
+            8000,
+            80400,
+            AudioFormat::Ds2Lp,
+            2,
+            "db6ef8b6e0ea569f10cf51a52f08cbc2",
+        )],
+    );
 }
 
 #[test]
@@ -506,16 +568,38 @@ fn ds2_olympus_qp7_empty64() {
 
 #[test]
 fn ds2_olympus_qp7_lp_empty109() {
-    refuses("ds2/olympus-qp7-lp-empty109.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "ds2/olympus-qp7-lp-empty109.ds2",
+        None,
+        &[
+            (
+                16000,
+                48128,
+                AudioFormat::Ds2Qp7,
+                7,
+                "205588ab2b9d57a3598e3a3c97d4a3f4",
+            ),
+            (8000, 24000, AudioFormat::Ds2Lp, 2, "cb0ce2d909492c16a818557b1dcb29ba"),
+        ],
+    );
 }
 
 #[test]
 fn ds2_olympus_qp7_lp() {
-    refuses("ds2/olympus-qp7-lp.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "ds2/olympus-qp7-lp.ds2",
+        None,
+        &[
+            (
+                16000,
+                48128,
+                AudioFormat::Ds2Qp7,
+                7,
+                "205588ab2b9d57a3598e3a3c97d4a3f4",
+            ),
+            (8000, 24000, AudioFormat::Ds2Lp, 2, "cb0ce2d909492c16a818557b1dcb29ba"),
+        ],
+    );
 }
 
 #[test]
@@ -900,16 +984,32 @@ fn dss_olympus_format1() {
 
 #[test]
 fn dss_olympus_lp_format_sp() {
-    refuses("dss/olympus-lp-format-sp.dss", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(2))
-    });
+    decodes(
+        "dss/olympus-lp-format-sp.dss",
+        None,
+        &[(
+            8000,
+            24000,
+            AudioFormat::DssLp,
+            2,
+            "cb0ce2d909492c16a818557b1dcb29ba",
+        )],
+    );
 }
 
 #[test]
 fn dss_olympus_lp_format4() {
-    refuses("dss/olympus-lp-format4.dss", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(4))
-    });
+    decodes(
+        "dss/olympus-lp-format4.dss",
+        None,
+        &[(
+            8000,
+            24000,
+            AudioFormat::DssLp,
+            4,
+            "cb0ce2d909492c16a818557b1dcb29ba",
+        )],
+    );
 }
 
 #[test]

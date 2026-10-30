@@ -42,6 +42,12 @@ variant of QP that adds a 12-byte comfort-noise "short" frame; it shares QP's
 synthesis and tables. A closely related family (Grundig DSS-SP / Digta CELP)
 is also supported by the decoder.
 
+LP blocks (format types `0x02` and `0x04`, 8000 Hz) do not use this codec
+family: they hold ITU-T G.723.1 frames of 24, 20, 4 or 1 bytes (6.3 kbit/s,
+5.3 kbit/s, SID, untransmitted), 240 samples each. `src/codec/g723_1.rs`
+decodes them as the Recommendation does; this document does not describe
+G.723.1.
+
 ### Architecture Summary
 
 ```

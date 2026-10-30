@@ -4,6 +4,7 @@
 /// QP mode (6): 56-byte frames, read from each block's anchor and across
 /// block boundaries.
 /// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
+/// LP mode (2 or 4): G.723.1 frames, read by the DSS block walk.
 use crate::demux::dss::{block_frames, dss_single_part, header_format, part_format, TaggedFrames};
 use crate::demux::{audio_start, check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
@@ -94,9 +95,9 @@ pub(crate) fn ds2_layout(data: &[u8], header_size: usize) -> Ds2Layout {
 }
 
 /// Demux a DS2 file.
-/// Returns (frame_data, total_frames, is_qp).
-/// For SP: frame_data is a Vec<Vec<u8>> of packets.
+/// For SP: a Vec<Vec<u8>> of packets.
 /// For QP/QP7: one segment holding every frame in file order.
+/// For LP: a Vec<Vec<u8>> of G.723.1 frames.
 pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
     let header_size = ds2_header_size(data)
         .map(|size| audio_start(data, size))
@@ -121,7 +122,9 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
             }
         }
     } else {
-        check_sp_codec(format_type)?;
+        if part_format(format_type) != Some(2) {
+            check_sp_codec(format_type)?;
+        }
         dss_single_part(data, header_size, format_type)?.0
     };
     let kind = tagged.first().map_or(format_type, |(tag, _)| *tag);
@@ -131,6 +134,11 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
         Ok(DemuxedDs2::Sp {
             total_frames,
             packets: frames,
+        })
+    } else if kind == 2 || kind == 4 {
+        Ok(DemuxedDs2::Lp {
+            total_frames,
+            frames,
         })
     } else if kind == 7 {
         let segments = if frames.is_empty() {
@@ -457,6 +465,10 @@ pub enum DemuxedDs2 {
         segments: Vec<Ds2Qp7Segment>,
         total_frames: usize,
     },
+    Lp {
+        frames: Vec<Vec<u8>>,
+        total_frames: usize,
+    },
 }
 
 pub(crate) struct Ds2QpStreamDemuxer {
@@ -619,13 +631,22 @@ mod tests {
     }
 
     #[test]
-    fn test_ds2_demux_refuses_lp_and_unknown_codecs() {
-        for mode in [2u8, 3, 4, 5, 8, 255] {
+    fn test_ds2_demux_refuses_unknown_codecs() {
+        for mode in [3u8, 5, 8, 255] {
             let data = make_ds2_file(mode, 4, 0x10);
             assert!(matches!(
                 demux_ds2(&data),
                 Err(DecodeError::UnsupportedCodec(m)) if m == mode
             ));
+        }
+    }
+
+    #[test]
+    fn test_ds2_demux_reads_lp_blocks() {
+        let payload = &make_ds2_file(2, 4, 0x10)[3 * DS2_BLOCK_SIZE + DS2_BLOCK_HEADER_SIZE..];
+        let expected: Vec<Vec<u8>> = payload.chunks(24).take(4).map(|f| f.to_vec()).collect();
+        for mode in [2u8, 4] {
+            assert_eq!(lp_frames_of(&make_ds2_file(mode, 4, 0x10)), expected, "{mode}");
         }
     }
 
@@ -761,6 +782,90 @@ mod tests {
         let mut frame = stream_bytes(start, len);
         frame.resize(DS2_QP_FRAME_SIZE, 0);
         frame
+    }
+
+    fn lp_frames_of(data: &[u8]) -> Vec<Vec<u8>> {
+        match demux_ds2(data).unwrap() {
+            DemuxedDs2::Lp {
+                frames,
+                total_frames,
+            } => {
+                assert_eq!(frames.len(), total_frames);
+                frames
+            }
+            _ => panic!("expected DS2 LP frames"),
+        }
+    }
+
+    /// G.723.1 frames of the given sizes, back to back, each with the type
+    /// bits that give its size.
+    fn lp_frames(sizes: &[usize]) -> Vec<Vec<u8>> {
+        let mut at = 0;
+        sizes
+            .iter()
+            .map(|&size| {
+                let mut frame = stream_bytes(at, size);
+                at += size;
+                let kind = match size {
+                    24 => 0,
+                    20 => 1,
+                    4 => 2,
+                    _ => 3,
+                };
+                frame[0] = frame[0] & !3 | kind;
+                frame
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_ds2_lp_type_bits_size_frames() {
+        let frames = lp_frames(&[24, 20, 4, 1, 24, 1]);
+        let data = qp_file(&[qp_block(anchor_byte(0), 6, 0xff, 2, &frames.concat())]);
+        assert_eq!(lp_frames_of(&data), frames);
+    }
+
+    #[test]
+    fn test_ds2_lp_frames_continue_across_blocks() {
+        let frames = lp_frames(&[24; 42]);
+        let stream = frames.concat();
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 22, 0xff, 2, &stream[..506]),
+            qp_block(anchor_byte(22), 20, 0xff, 2, &stream[506..]),
+        ]);
+        assert_eq!(lp_frames_of(&data), frames);
+    }
+
+    #[test]
+    fn test_ds2_lp_resync_block_drops_partial_frame() {
+        let frames = lp_frames(&[24; 43]);
+        let stream = frames.concat();
+        let mut second = vec![0u8; 30];
+        second.extend_from_slice(&stream[528..]);
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 22, 0xff, 2, &stream[..506]),
+            qp_block(anchor_byte(30), 19, 0xff, 2, &second[..506]),
+        ]);
+        let mut expected = frames[..21].to_vec();
+        expected.extend_from_slice(&frames[22..41]);
+        assert_eq!(lp_frames_of(&data), expected);
+    }
+
+    #[test]
+    fn test_ds2_lp_pause_block_frames_from_byte5() {
+        let frames = lp_frames(&[24, 4, 1, 1, 20]);
+        let data = qp_file(&[qp_block(anchor_byte(0), 0, 5, 2, &frames.concat())]);
+        assert_eq!(lp_frames_of(&data), frames);
+    }
+
+    #[test]
+    fn test_ds2_lp_file_ending_inside_frame_zero_fills_it() {
+        let frames = lp_frames(&[24, 24]);
+        let data = qp_file(&[qp_block(anchor_byte(0), 2, 0xff, 2, &frames.concat())]);
+        let cut = &data[..3 * DS2_BLOCK_SIZE + DS2_BLOCK_HEADER_SIZE + 30];
+        let mut last = frames[1][..6].to_vec();
+        last.resize(24, 0);
+        assert_eq!(lp_frames_of(cut), vec![frames[0].clone(), last]);
     }
 
     #[test]

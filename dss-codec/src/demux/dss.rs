@@ -4,6 +4,13 @@
 /// first frame, the byte-swap parity of that frame and the number of frames
 /// that start in the block. Frames are read through the block headers they
 /// straddle. A frame that the file does not hold in full ends the stream.
+///
+/// QP and LP frames are not byte-swapped. They run on from block to block,
+/// and each block's anchor, where its first frame starts, is checked against
+/// the frame in progress: a frame that does not end at the anchor is dropped
+/// and reading resumes there. An LP frame is a G.723.1 frame, as long as the
+/// type in the two low bits of its first byte says.
+use crate::codec::g723_1;
 use crate::demux::ds2::block_anchor;
 use crate::error::{DecodeError, Result};
 
@@ -51,9 +58,11 @@ pub fn demux_dss(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
         return Err(DecodeError::Truncated("DSS header".to_string()));
     }
     let codec = crate::demux::ds2::detect_ds2_format_type(data, header_size);
-    crate::demux::check_sp_codec(codec)?;
+    if part_format(codec) != Some(2) {
+        crate::demux::check_sp_codec(codec)?;
+    }
     let (frames, _cut) = dss_single_part(data, header_size, codec)?;
-    if let Some(&(tag, _)) = frames.first().filter(|(tag, _)| *tag != 0 && *tag != 1) {
+    if let Some(&(tag, _)) = frames.first().filter(|(tag, _)| !matches!(tag, 0 | 1 | 2 | 4)) {
         return Err(DecodeError::UnsupportedCodec(tag));
     }
     let frames: Vec<Vec<u8>> = frames.into_iter().map(|(_, frame)| frame).collect();
@@ -79,7 +88,6 @@ pub(crate) fn dss_single_part(
                 frames.push((tag, frame))
             }
             DssStep::Frame(tag, _) => return Err(DecodeError::MultipleParts(tag)),
-            DssStep::Unsupported(raw) => return Err(DecodeError::MultipleParts(raw)),
             DssStep::NeedMore => return Ok((frames, false)),
             DssStep::Dropped => {}
             DssStep::End { cut } => return Ok((frames, cut)),
@@ -134,7 +142,6 @@ enum DssStep {
     Frame(u8, Vec<u8>),
     Dropped,
     NeedMore,
-    Unsupported(u8),
     End { cut: bool },
 }
 
@@ -147,11 +154,11 @@ struct DssSpWalker {
     frames_left: usize,
     swap: bool,
     swap_byte: Option<u8>,
-    qp_left: usize,
-    qp_frame_size: usize,
+    anchored_left: usize,
+    frame_size: usize,
     qp_block_format: u8,
+    lp_block_format: u8,
     cut: bool,
-    unsupported: Option<u8>,
 }
 
 impl DssSpWalker {
@@ -164,19 +171,16 @@ impl DssSpWalker {
             frames_left: 0,
             swap: false,
             swap_byte: None,
-            qp_left: 0,
-            qp_frame_size: DSS_QP_FRAME_SIZE,
+            anchored_left: 0,
+            frame_size: DSS_QP_FRAME_SIZE,
             qp_block_format: format,
+            lp_block_format: format,
             cut: false,
-            unsupported: None,
         }
     }
 
     fn step(&mut self, src: &DssBytes) -> DssStep {
         loop {
-            if let Some(raw) = self.unsupported {
-                return DssStep::Unsupported(raw);
-            }
             let saved = *self;
             match self.read_frame(src) {
                 Ok(step) => return step,
@@ -195,7 +199,7 @@ impl DssSpWalker {
         self.swap = false;
         self.swap_byte = None;
         if self.format == 2 {
-            self.unsupported = Some(raw);
+            self.lp_block_format = raw;
         }
     }
 
@@ -205,8 +209,8 @@ impl DssSpWalker {
     }
 
     fn read_frame(&mut self, src: &DssBytes) -> std::result::Result<DssStep, Short> {
-        if self.format == 6 {
-            return self.read_qp_frame(src);
+        if self.format == 6 || self.format == 2 {
+            return self.read_anchored_frame(src);
         }
         if self.frames_left == 0 {
             match self.next_block(src) {
@@ -345,9 +349,36 @@ impl DssSpWalker {
         self.swap = !self.swap;
     }
 
-    fn read_qp_frame(&mut self, src: &DssBytes) -> std::result::Result<DssStep, Short> {
-        while self.frames_left == 0 || self.qp_left == 0 {
-            match self.qp_next_block(src, 0) {
+    /// Size of the whole frame when the part has frames of one size, else
+    /// the size of the head that tells the frame's size.
+    fn head_size(&self, frame_format: u8) -> usize {
+        match frame_format {
+            7 => 2,
+            2 => 1,
+            _ => DSS_QP_FRAME_SIZE,
+        }
+    }
+
+    fn sized_frame(&self, frame_format: u8, head: &[u8]) -> usize {
+        match frame_format {
+            7 if head[1] & 0x80 == 0 => DSS_QP7_NOISE_FRAME_SIZE,
+            2 => g723_1::frame_size(head[0]),
+            _ => DSS_QP_FRAME_SIZE,
+        }
+    }
+
+    fn frame_tag(&self, frame_format: u8) -> u8 {
+        if self.format == 2 {
+            self.lp_block_format
+        } else {
+            qp_tag(frame_format)
+        }
+    }
+
+    /// Reads a QP or LP frame.
+    fn read_anchored_frame(&mut self, src: &DssBytes) -> std::result::Result<DssStep, Short> {
+        while self.frames_left == 0 || self.anchored_left == 0 {
+            match self.next_anchored_block(src, 0) {
                 Err(Short::End) => return Ok(DssStep::End { cut: self.cut }),
                 other => other?,
             };
@@ -355,16 +386,17 @@ impl DssSpWalker {
 
         let mut frame = [0u8; DSS_QP_FRAME_SIZE];
         let mut offset = 0;
-        let mut frame_format = self.qp_block_format;
-        self.qp_frame_size = DSS_QP_FRAME_SIZE;
-        while offset < self.qp_frame_size {
-            let mut size = (self.qp_frame_size - offset).min(self.qp_left);
+        let mut frame_format = self.anchored_format();
+        self.frame_size = self.head_size(frame_format);
+        while offset < self.frame_size {
+            let mut size = (self.frame_size - offset).min(self.anchored_left);
             if size == 0 {
-                match self.qp_next_block(src, offset) {
-                    Err(Short::End) => return Ok(self.qp_truncated(frame, offset, frame_format)),
+                match self.next_anchored_block(src, offset) {
+                    Err(Short::End) => return Ok(self.truncated(frame, offset, frame_format)),
                     Ok(true) => {
                         offset = 0;
-                        self.qp_frame_size = DSS_QP_FRAME_SIZE;
+                        frame_format = self.anchored_format();
+                        self.frame_size = self.head_size(frame_format);
                     }
                     other => {
                         other?;
@@ -374,42 +406,46 @@ impl DssSpWalker {
             }
 
             if offset == 0 {
-                frame_format = self.qp_block_format;
-                if frame_format == 7 {
-                    size = size.min(2);
-                }
+                frame_format = self.anchored_format();
+                size = size.min(self.head_size(frame_format));
             }
             let bytes = src.avail(self.pos, size)?;
             let got = bytes.len();
             frame[offset..offset + got].copy_from_slice(bytes);
             self.pos += got;
             if got < size {
-                return Ok(self.qp_truncated(frame, offset + got, frame_format));
+                return Ok(self.truncated(frame, offset + got, frame_format));
             }
             if offset == 0 {
                 self.frames_left -= 1;
-                if frame_format == 7 && frame[1] & 0x80 == 0 {
-                    self.qp_frame_size = DSS_QP7_NOISE_FRAME_SIZE;
-                }
+                self.frame_size = self.sized_frame(frame_format, &frame);
             }
             offset += size;
-            self.qp_left -= size;
+            self.anchored_left -= size;
         }
-        Ok(DssStep::Frame(qp_tag(frame_format), frame[..self.qp_frame_size].to_vec()))
+        Ok(DssStep::Frame(self.frame_tag(frame_format), frame[..self.frame_size].to_vec()))
     }
 
-    fn qp_truncated(&mut self, mut frame: [u8; DSS_QP_FRAME_SIZE], offset: usize, format: u8) -> DssStep {
+    fn anchored_format(&self) -> u8 {
+        if self.format == 2 {
+            2
+        } else {
+            self.qp_block_format
+        }
+    }
+
+    fn truncated(&mut self, mut frame: [u8; DSS_QP_FRAME_SIZE], offset: usize, format: u8) -> DssStep {
         if offset == 0 {
             self.cut |= self.frames_left > 0;
             return DssStep::End { cut: self.cut };
         }
         frame[offset..].fill(0);
-        self.qp_left = 0;
+        self.anchored_left = 0;
         self.cut = true;
-        DssStep::Frame(qp_tag(format), frame[..self.qp_frame_size].to_vec())
+        DssStep::Frame(self.frame_tag(format), frame[..self.frame_size].to_vec())
     }
 
-    fn qp_next_block(&mut self, src: &DssBytes, in_frame: usize) -> std::result::Result<bool, Short> {
+    fn next_anchored_block(&mut self, src: &DssBytes, in_frame: usize) -> std::result::Result<bool, Short> {
         self.block_pos += DSS_BLOCK_SIZE;
         let header = src.get(self.block_pos, DSS_BLOCK_HEADER_SIZE)?;
         if self.other_format(header) {
@@ -425,20 +461,20 @@ impl DssSpWalker {
         let anchor = block_anchor(header);
         self.pos = self.block_pos + DSS_BLOCK_HEADER_SIZE;
         if self.frames_left == 0 {
-            self.qp_left = anchor;
+            self.anchored_left = anchor;
             return Ok(false);
         }
         let resync = if in_frame > 0 {
-            in_frame + anchor != self.qp_frame_size
+            in_frame + anchor != self.frame_size
         } else {
             anchor != 0
         };
         if resync {
-            self.qp_left = DSS_BLOCK_PAYLOAD_SIZE - anchor;
+            self.anchored_left = DSS_BLOCK_PAYLOAD_SIZE - anchor;
             self.pos += anchor;
             return Ok(true);
         }
-        self.qp_left = DSS_BLOCK_PAYLOAD_SIZE;
+        self.anchored_left = DSS_BLOCK_PAYLOAD_SIZE;
         Ok(false)
     }
 }
@@ -490,13 +526,12 @@ impl DssSpStreamDemuxer {
     pub(crate) fn finish(&mut self) -> Result<TaggedFrames> {
         self.check_header()?;
         let (frames, cut) = self.walk(true)?;
-        self.check_codec()?;
         let tail = (self.base + self.buf.len()).saturating_sub(self.walker.header_size);
         if cut && !tail.is_multiple_of(DSS_BLOCK_SIZE) {
-            let frame = if self.walker.format == 6 {
-                "DS2 QP frame"
-            } else {
-                "DSS SP frame"
+            let frame = match self.walker.format {
+                6 => "DS2 QP frame",
+                2 => "LP frame",
+                _ => "DSS SP frame",
             };
             return Err(DecodeError::Truncated(frame.to_string()));
         }
@@ -505,16 +540,7 @@ impl DssSpStreamDemuxer {
 
     pub(crate) fn finish_lenient(&mut self) -> Result<TaggedFrames> {
         self.check_header()?;
-        let frames = self.walk(true)?.0;
-        self.check_codec()?;
-        Ok(frames)
-    }
-
-    fn check_codec(&self) -> Result<()> {
-        match self.walker.unsupported {
-            Some(raw) => Err(DecodeError::UnsupportedCodec(raw)),
-            None => Ok(()),
-        }
+        Ok(self.walk(true)?.0)
     }
 
     fn check_header(&self) -> Result<()> {
@@ -538,10 +564,6 @@ impl DssSpStreamDemuxer {
                 DssStep::Dropped => {}
                 DssStep::NeedMore => break false,
                 DssStep::End { cut } => break cut,
-                DssStep::Unsupported(raw) if frames.is_empty() => {
-                    return Err(DecodeError::UnsupportedCodec(raw));
-                }
-                DssStep::Unsupported(_) => break false,
             }
         };
 
@@ -956,9 +978,37 @@ mod tests {
         assert_eq!(total, 0);
     }
 
+    /// The 3 frames of `make_dss_block(0, 3, 3, 0x20)` read as LP: its
+    /// payload starts 0x20, 0x21, ..., so every frame is a 24-byte 6.3 kbit/s
+    /// frame.
+    fn lp_frames(block: &[u8]) -> Vec<Vec<u8>> {
+        let payload = &block[DSS_BLOCK_HEADER_SIZE..];
+        payload.chunks(24).take(3).map(|frame| frame.to_vec()).collect()
+    }
+
     #[test]
-    fn test_dss_demux_refuses_lp_and_unknown_codecs() {
-        for codec in [2u8, 3, 0xff] {
+    fn test_dss_demux_reads_lp() {
+        for codec in [2u8, 4] {
+            let mut lp = make_dss_block(0, 3, 3, 0x20);
+            lp[4] = codec;
+            let data = make_dss_file(&[lp]);
+            assert_eq!(demux_dss(&data).unwrap(), (lp_frames(&lp), 3), "{codec}");
+            for chunk in [1, 7, 100] {
+                let mut demuxer = DssSpStreamDemuxer::with_format(2 * DSS_BLOCK_SIZE, codec);
+                let mut tagged = Vec::new();
+                for piece in data.chunks(chunk) {
+                    tagged.extend(demuxer.push(piece).unwrap());
+                }
+                tagged.extend(demuxer.finish().unwrap());
+                assert!(tagged.iter().all(|(tag, _)| *tag == codec));
+                assert_eq!(frames_of(tagged), lp_frames(&lp));
+            }
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_refuses_unknown_codecs() {
+        for codec in [3u8, 0xff] {
             let mut block = make_dss_block(0, 3, 3, 0x20);
             block[4] = codec;
             assert!(matches!(
@@ -995,24 +1045,44 @@ mod tests {
     }
 
     #[test]
-    fn test_dss_demux_refuses_lp_after_empty_block() {
+    fn test_dss_demux_reads_lp_after_empty_block() {
         let mut lp = make_dss_block(0, 3, 3, 0x20);
         lp[4] = 2;
         let data = make_dss_file(&[make_dss_block(0, 3, 0, 0x10), lp]);
-        assert!(matches!(demux_dss(&data), Err(DecodeError::UnsupportedCodec(2))));
+        assert_eq!(demux_dss(&data).unwrap(), (lp_frames(&lp), 3));
     }
 
     #[test]
-    fn test_dss_demux_refuses_lp_in_partial_first_block() {
+    fn test_dss_demux_reads_lp_in_partial_first_block() {
         let mut lp = make_dss_block(0, 3, 3, 0x20);
         lp[4] = 2;
         let data = make_dss_file(&[lp]);
-        for end in [2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE, 2 * DSS_BLOCK_SIZE + 100] {
-            assert!(matches!(
-                demux_dss(&data[..end]),
-                Err(DecodeError::UnsupportedCodec(2))
-            ));
+        let header_only = &data[..2 * DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE];
+        assert_eq!(demux_dss(header_only).unwrap(), (Vec::new(), 0));
+        let frames = demux_dss(&data[..2 * DSS_BLOCK_SIZE + 100]).unwrap();
+        assert_eq!(frames, (lp_frames(&lp), 3));
+    }
+
+    #[test]
+    fn test_dss_demux_lp_frame_straddles_blocks() {
+        let mut first = make_dss_block(0, 3, 22, 0x20);
+        let mut second = make_dss_block(0, 14, 1, 0x40);
+        first[4] = 2;
+        second[4] = 2;
+        for (i, byte) in first[DSS_BLOCK_HEADER_SIZE..].iter_mut().enumerate() {
+            *byte = if i % 24 == 0 { 0 } else { i as u8 };
         }
+        second[DSS_BLOCK_HEADER_SIZE + 22] = 0x01;
+        let (frames, total) = demux_dss(&make_dss_file(&[first, second])).unwrap();
+        assert_eq!(total, 23);
+        let last = &frames[21];
+        assert_eq!(last[..2], first[DSS_BLOCK_SIZE - 2..]);
+        assert_eq!(last[2..], second[DSS_BLOCK_HEADER_SIZE..DSS_BLOCK_HEADER_SIZE + 22]);
+        assert_eq!(frames[22].len(), 20);
+        assert_eq!(
+            frames[22][..],
+            second[DSS_BLOCK_HEADER_SIZE + 22..DSS_BLOCK_HEADER_SIZE + 42]
+        );
     }
 
     #[test]
@@ -1114,21 +1184,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dss_demux_refuses_lp_after_short_or_long_header() {
+    fn test_dss_demux_reads_lp_after_short_or_long_header() {
         let mut lp = make_dss_block(0, 3, 3, 0x20);
         lp[4] = 2;
+        let expected = (lp_frames(&lp), 3);
         for first_byte in [0u8, 1] {
             let mut data = make_dss_file(&[lp]);
             data[0] = first_byte;
             data[DSS_BLOCK_SIZE..DSS_BLOCK_SIZE + DSS_BLOCK_HEADER_SIZE]
                 .copy_from_slice(&EMPTY_HEADER_BLOCK);
-            let result = demux_dss(&data);
-            assert!(matches!(result, Err(DecodeError::UnsupportedCodec(2))));
+            assert_eq!(demux_dss(&data).unwrap(), expected, "{first_byte}");
         }
         for first_byte in [8u8, 19] {
             let data = with_header_blocks(first_byte, &lp);
-            let result = demux_dss(&data);
-            assert!(matches!(result, Err(DecodeError::UnsupportedCodec(2))));
+            assert_eq!(demux_dss(&data).unwrap(), expected, "{first_byte}");
         }
     }
 

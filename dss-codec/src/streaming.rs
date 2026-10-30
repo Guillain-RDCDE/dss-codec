@@ -1,4 +1,5 @@
 use crate::codec::ds2_qp::Ds2QpDecoder;
+use crate::codec::g723_1::G7231Decoder;
 use crate::codec::grundig_sp::GrundigSpDecoder;
 use crate::crypto::ds2_encrypted::{EncryptedDs2BlockDecryptor, ENCRYPTED_MAGIC};
 use crate::demux::ds2::{
@@ -53,6 +54,7 @@ enum ActiveDecoder {
     Dss(GrundigSpDecoder),
     Ds2Qp(Ds2QpDecoder),
     Grundig(GrundigSpDecoder),
+    Lp(G7231Decoder),
 }
 
 impl StreamingDecoder {
@@ -238,6 +240,20 @@ impl StreamingDecoder {
                 self.demuxer = Some(ActiveDemuxer::Ds2Qp(Ds2QpStreamDemuxer::new()));
                 self.decoder = Some(ActiveDecoder::Ds2Qp(Ds2QpDecoder::new()));
             }
+            AudioFormat::DssLp | AudioFormat::Ds2Lp => {
+                let header_size = if format == AudioFormat::DssLp {
+                    dss_header_size(&self.prebuffer).unwrap_or(512)
+                } else {
+                    ds2_header_size(&self.prebuffer).unwrap_or(3 * 512)
+                };
+                let start = audio_start(&self.prebuffer, header_size);
+                self.block_format = known_ds2_format_type(&self.prebuffer, start).unwrap_or(2);
+                self.demuxer = Some(ActiveDemuxer::Dss(DssSpStreamDemuxer::with_format(
+                    start,
+                    self.block_format,
+                )));
+                self.decoder = Some(ActiveDecoder::Lp(G7231Decoder::new()));
+            }
             AudioFormat::GrundigSp => {
                 let header_size = dss_header_size(&self.prebuffer).unwrap_or(6 * 512);
                 self.demuxer = Some(ActiveDemuxer::Grundig(GrundigSpStreamDemuxer::new(
@@ -341,12 +357,20 @@ impl StreamingDecoder {
         if !self.parts.is_empty() || decoder_kind(tag) != decoder_kind(self.block_format) {
             self.decoder = Some(match tag {
                 6 | 7 => ActiveDecoder::Ds2Qp(Ds2QpDecoder::new()),
+                2 | 4 => ActiveDecoder::Lp(G7231Decoder::new()),
                 _ => ActiveDecoder::Dss(GrundigSpDecoder::with_variable_rate(tag == 1)),
             });
         }
+        let dss = matches!(
+            self.format,
+            Some(AudioFormat::DssSp | AudioFormat::DssLp | AudioFormat::GrundigSp)
+        );
         let format = match (tag, self.format) {
             (6, _) => AudioFormat::Ds2Qp,
             (7, _) => AudioFormat::Ds2Qp7,
+            (2 | 4, _) if dss => AudioFormat::DssLp,
+            (2 | 4, _) => AudioFormat::Ds2Lp,
+            (_, Some(AudioFormat::DssLp)) => AudioFormat::DssSp,
             (_, Some(AudioFormat::DssSp)) => AudioFormat::DssSp,
             (1, Some(AudioFormat::GrundigSp)) => AudioFormat::DssSp,
             (_, Some(AudioFormat::GrundigSp)) => AudioFormat::GrundigSp,
@@ -394,6 +418,10 @@ impl StreamingDecoder {
                     let frame_samples = decoder.decode_frame(&frame);
                     samples.extend(frame_samples.into_iter().map(|sample| sample as f64));
                 }
+                Some(ActiveDecoder::Lp(decoder)) => {
+                    let frame_samples = decoder.decode_frame(&frame);
+                    samples.extend(frame_samples.into_iter().map(f64::from));
+                }
                 None => {}
             }
             self.add_to_part(samples.len() - before);
@@ -404,10 +432,10 @@ impl StreamingDecoder {
 }
 
 fn decoder_kind(tag: u8) -> u8 {
-    if tag == 7 {
-        6
-    } else {
-        tag
+    match tag {
+        7 => 6,
+        4 => 2,
+        _ => tag,
     }
 }
 
@@ -855,30 +883,66 @@ mod tests {
     #[test]
     fn test_streaming_decoder_refuses_other_codecs_after_any_dss_header() {
         for first_byte in [0u8, 6, 8, 19] {
-            for codec in [2u8, 6] {
-                let data = dss_with_header_blocks(first_byte, codec);
-                let err = stream_decode(&data, 100).unwrap_err();
-                assert!(matches!(err, DecodeError::UnsupportedCodec(c) if c == codec));
-                assert!(matches!(
-                    crate::decode_to_buffer(&data),
-                    Err(DecodeError::UnsupportedCodec(c)) if c == codec
-                ));
+            let data = dss_with_header_blocks(first_byte, 6);
+            let err = stream_decode(&data, 100).unwrap_err();
+            assert!(matches!(err, DecodeError::UnsupportedCodec(6)));
+            assert!(matches!(
+                crate::decode_to_buffer(&data),
+                Err(DecodeError::UnsupportedCodec(6))
+            ));
+
+            let data = dss_with_header_blocks(first_byte, 2);
+            let (samples, format) = stream_decode(&data, 100).unwrap();
+            assert_eq!(format, Some(AudioFormat::DssLp));
+            assert_eq!(samples, lp_samples(&lp_frames(&data)));
+        }
+    }
+
+    /// The LP frames of a file with one LP part, from the batch demuxer.
+    fn lp_frames(data: &[u8]) -> Vec<Vec<u8>> {
+        if data[1..4] == *b"dss" {
+            crate::demux::dss::demux_dss(data).unwrap().0
+        } else {
+            match demux_ds2(data).unwrap() {
+                DemuxedDs2::Lp { frames, .. } => frames,
+                _ => panic!("expected LP frames"),
             }
         }
     }
 
+    fn lp_samples(frames: &[Vec<u8>]) -> Vec<f64> {
+        let mut decoder = G7231Decoder::new();
+        frames
+            .iter()
+            .flat_map(|frame| decoder.decode_frame(frame))
+            .map(f64::from)
+            .collect()
+    }
+
     #[test]
-    fn test_streaming_decoder_refuses_lp() {
-        for (prefix, header_size) in [(b"\x03ds2", 0x600), (b"\x02dss", 0x400)] {
-            let data = sp_file(prefix, header_size, 2);
-            let err = stream_decode(&data, 100).unwrap_err();
-            assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
-            let err = stream_decode(&data, data.len()).unwrap_err();
-            assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
-            assert!(matches!(
-                crate::decode_to_buffer(&data),
-                Err(DecodeError::UnsupportedCodec(2))
-            ));
+    fn test_streaming_decoder_decodes_lp() {
+        for (prefix, header_size, format) in [
+            (b"\x03ds2", 0x600, AudioFormat::Ds2Lp),
+            (b"\x02dss", 0x400, AudioFormat::DssLp),
+        ] {
+            for codec in [2u8, 4] {
+                let data = sp_file(prefix, header_size, codec);
+                let frames = lp_frames(&data);
+                assert_eq!(frames.len(), 3);
+                let expected = lp_samples(&frames);
+                assert_eq!(expected.len(), 3 * 240);
+                for chunk in [1, 7, 100, data.len()] {
+                    assert_eq!(
+                        stream_decode(&data, chunk).unwrap(),
+                        (expected.clone(), Some(format)),
+                        "{format:?} {codec}, chunk {chunk}"
+                    );
+                }
+                let buffer = crate::decode_to_buffer(&data).unwrap();
+                assert_eq!((buffer.format, buffer.native_rate), (format, 8000));
+                assert_eq!(buffer.samples, expected);
+                assert_eq!(buffer.parts, [part(0, expected.len(), format, codec)]);
+            }
         }
     }
 
@@ -918,32 +982,31 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_decoder_refuses_lp_after_empty_dss_block() {
+    fn test_streaming_decoder_decodes_lp_after_empty_dss_block() {
         let mut data = sp_file(b"\x02dss", 0x400, 0);
         data[0x400 + 2] = 0;
         let mut block = sp_block(2);
         block[4] = 2;
         data.extend_from_slice(&block);
-        let err = stream_decode(&data, 7).unwrap_err();
-        assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
-        assert!(matches!(
-            crate::decode_to_buffer(&data),
-            Err(DecodeError::UnsupportedCodec(2))
-        ));
+        let expected = lp_samples(&lp_frames(&data));
+        assert_eq!(expected.len(), 2 * 240);
+        let (samples, format) = stream_decode(&data, 7).unwrap();
+        assert_eq!((samples, format), (expected.clone(), Some(AudioFormat::DssLp)));
+        assert_eq!(crate::decode_to_buffer(&data).unwrap().samples, expected);
     }
 
     #[test]
-    fn test_streaming_decoder_refuses_lp_in_partial_dss_block() {
+    fn test_streaming_decoder_lp_cut_after_block_header() {
         let data = sp_file(b"\x02dss", 0x400, 2);
         let cut = &data[..0x400 + 6];
         let err = stream_decode(cut, 7).unwrap_err();
-        assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
-        let err = StreamingDecoder::new().push(cut).unwrap_err();
-        assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
-        assert!(matches!(
-            crate::decode_to_buffer(cut),
-            Err(DecodeError::UnsupportedCodec(2))
-        ));
+        assert!(matches!(err, DecodeError::Truncated(what) if what == "LP frame"));
+        let mut decoder = StreamingDecoder::new();
+        assert!(decoder.push(cut).unwrap().is_empty());
+        assert_eq!(decoder.format(), Some(AudioFormat::DssLp));
+        let buffer = crate::decode_to_buffer(cut).unwrap();
+        assert!(buffer.samples.is_empty());
+        assert_eq!(buffer.format, AudioFormat::DssLp);
     }
 
     #[test]
@@ -1007,10 +1070,12 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_decoder_refuses_lp_after_empty_ds2_block() {
+    fn test_streaming_decoder_decodes_lp_after_empty_ds2_block() {
         let data = ds2_with_empty_first_block(2);
-        let err = stream_decode(&data, 7).unwrap_err();
-        assert!(matches!(err, DecodeError::UnsupportedCodec(2)));
+        let expected = lp_samples(&lp_frames(&data));
+        assert_eq!(expected.len(), 2 * 240);
+        let (samples, format) = stream_decode(&data, 7).unwrap();
+        assert_eq!((samples, format), (expected, Some(AudioFormat::Ds2Lp)));
     }
 
     #[test]
@@ -1422,6 +1487,7 @@ mod tests {
                     .flat_map(|segment| segment.records)
                     .collect(),
             ),
+            DemuxedDs2::Lp { frames, .. } => (2, frames),
         };
         for (prefix, header_size, format, other, at) in [
             (b"\x03ds2", 0x600, 6u8, 7u8, 1usize),
@@ -1468,7 +1534,7 @@ mod tests {
 
     #[test]
     fn test_grundig_file_decodes_each_part_with_its_own_codec() {
-        use AudioFormat::{Ds2Qp, Ds2Qp7, DssSp, GrundigSp};
+        use AudioFormat::{Ds2Qp, Ds2Qp7, DssLp, DssSp, GrundigSp};
         let head = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3)]);
         let (head_samples, head_parts) = decode_parts(&head, 100);
         assert_eq!(head_parts, [part(0, head_samples.len(), GrundigSp, 0)]);
@@ -1497,10 +1563,19 @@ mod tests {
         }
         for lp in [2u8, 4] {
             let data = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3), (lp, 3)]);
-            assert!(matches!(
-                crate::decode_to_buffer(&data),
-                Err(DecodeError::UnsupportedCodec(c)) if c == lp
-            ));
+            let (tail_samples, _) = decode_parts(&joined(b"\x02dss", 0x400, &[(lp, 3)]), 100);
+            let expected = (
+                [head_samples.clone(), tail_samples.clone()].concat(),
+                vec![
+                    part(0, head_samples.len(), GrundigSp, 0),
+                    part(head_samples.len(), tail_samples.len(), DssLp, lp),
+                ],
+            );
+            for chunk in [7, data.len()] {
+                assert_eq!(decode_parts(&data, chunk), expected, "0 then {lp}");
+            }
+            let buffer = crate::decode_to_buffer(&data).unwrap();
+            assert_eq!((buffer.samples, buffer.parts), expected);
         }
         for unknown in [3u8, 5, 8, 0xff] {
             let data = joined(b"\x06dss", 0xc00, &[(0, 3), (0, 3), (unknown, 3)]);
@@ -1566,6 +1641,7 @@ mod tests {
                         7,
                         segments.into_iter().flat_map(|seg| seg.records).collect(),
                     ),
+                    DemuxedDs2::Lp { frames, .. } => (2, frames),
                 };
                 let one_part = joined(prefix, header_size, &[(rest, 3)]);
                 let mut cut = vec![0u8; header_size];
@@ -1639,39 +1715,33 @@ mod tests {
     }
 
     #[test]
-    fn test_streaming_decoder_refuses_lp_part() {
-        for (prefix, header_size, first) in
-            [(b"\x02dss", 0x400, 0u8), (b"\x03ds2", 0x600, 1), (b"\x03ds2", 0x600, 6)]
-        {
+    fn test_streaming_decoder_decodes_lp_part() {
+        for (prefix, header_size, first, lp_format) in [
+            (b"\x02dss", 0x400, 0u8, AudioFormat::DssLp),
+            (b"\x03ds2", 0x600, 1, AudioFormat::Ds2Lp),
+            (b"\x03ds2", 0x600, 6, AudioFormat::Ds2Lp),
+            (b"\x03ds2", 0x600, 7, AudioFormat::Ds2Lp),
+        ] {
             let (head, head_parts) = decode_parts(&joined(prefix, header_size, &[(first, 3)]), 100);
             for lp in [2u8, 4] {
+                let (tail, _) = decode_parts(&joined(prefix, header_size, &[(lp, 3)]), 100);
+                assert_eq!(tail.len(), 3 * 240);
+                let mut parts = head_parts.clone();
+                parts.push(part(head.len(), tail.len(), lp_format, lp));
+                let expected = ([head.clone(), tail].concat(), parts);
+
                 let data = joined(prefix, header_size, &[(first, 3), (lp, 3)]);
                 for chunk in [1, 7, data.len()] {
-                    let mut decoder = StreamingDecoder::new();
-                    let mut samples = Vec::new();
-                    let mut err = None;
-                    for piece in data.chunks(chunk) {
-                        match decoder.push(piece) {
-                            Ok(more) => samples.extend(more),
-                            Err(e) => {
-                                err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    let err = err.or_else(|| decoder.finish().err());
-                    assert!(matches!(err, Some(DecodeError::UnsupportedCodec(c)) if c == lp));
-                    if first == 6 {
-                        assert!(samples.is_empty());
-                    } else {
-                        assert_eq!(samples, head);
-                        assert_eq!(decoder.parts(), head_parts);
-                    }
+                    assert_eq!(decode_parts(&data, chunk), expected, "{first} then {lp}");
                 }
-                assert!(matches!(
-                    crate::decode_to_buffer(&data),
-                    Err(DecodeError::UnsupportedCodec(c)) if c == lp
-                ));
+                let buffer = crate::decode_to_buffer(&data).unwrap();
+                assert_eq!((buffer.samples, buffer.parts), expected);
+
+                let data = joined(prefix, header_size, &[(lp, 3), (first, 3)]);
+                let (samples, parts) = decode_parts(&data, 7);
+                assert_eq!(parts.len(), 2, "{lp} then {first}");
+                assert_eq!(parts[0], part(0, 3 * 240, lp_format, lp));
+                assert_eq!(samples[..3 * 240], expected.0[head.len()..]);
             }
         }
     }
@@ -1682,6 +1752,7 @@ mod tests {
             DemuxedDs2::Sp { total_frames, .. } => (0, total_frames),
             DemuxedDs2::QpSegments { total_frames, .. } => (6, total_frames),
             DemuxedDs2::Qp7Segments { total_frames, .. } => (7, total_frames),
+            DemuxedDs2::Lp { total_frames, .. } => (2, total_frames),
         };
         for (first, second, kind) in [
             (1u8, 6u8, 0),

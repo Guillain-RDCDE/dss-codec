@@ -16,6 +16,10 @@ pub enum AudioFormat {
     Ds2Qp,
     /// DS2 file (.ds2), QP7 mode (mode byte 7), 16000 Hz
     Ds2Qp7,
+    /// DSS file (.dss), LP blocks (format byte 2 or 4): G.723.1, 8000 Hz
+    DssLp,
+    /// DS2 file (.ds2), LP blocks (format byte 2 or 4): G.723.1, 8000 Hz
+    Ds2Lp,
     /// Grundig DSS file (first byte 6, magic "dss", codec byte 0), SP codec at
     /// 12000 Hz output
     GrundigSp,
@@ -26,14 +30,17 @@ impl AudioFormat {
         match self {
             AudioFormat::DssSp | AudioFormat::Ds2Sp => 12000,
             AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => 16000,
+            AudioFormat::DssLp | AudioFormat::Ds2Lp => 8000,
             AudioFormat::GrundigSp => 12000,
         }
     }
 
     pub fn extension(&self) -> &'static str {
         match self {
-            AudioFormat::DssSp => "dss",
-            AudioFormat::Ds2Sp | AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 => "ds2",
+            AudioFormat::DssSp | AudioFormat::DssLp => "dss",
+            AudioFormat::Ds2Sp | AudioFormat::Ds2Qp | AudioFormat::Ds2Qp7 | AudioFormat::Ds2Lp => {
+                "ds2"
+            }
             AudioFormat::GrundigSp => "dss",
         }
     }
@@ -61,32 +68,32 @@ pub fn detect_format(data: &[u8]) -> Option<AudioFormat> {
     }
     if let Some(header_size) = dss_header_size(data) {
         let start = audio_start(data, header_size);
-        if data[0] == 6 && detect_ds2_format_type(data, start) == 0 {
-            return Some(AudioFormat::GrundigSp);
-        }
-        return Some(AudioFormat::DssSp);
+        return Some(match detect_ds2_format_type(data, start) {
+            0 if data[0] == 6 => AudioFormat::GrundigSp,
+            2 | 4 => AudioFormat::DssLp,
+            _ => AudioFormat::DssSp,
+        });
     }
     if data[..4] == *b"\x03enc" && data.len() >= 0x600 + DS2_BLOCK_HEADER_SIZE {
-        let format_type = detect_ds2_format_type(data, audio_start(data, 0x600));
-        return Some(match format_type {
-            7 => AudioFormat::Ds2Qp7,
-            6 => AudioFormat::Ds2Qp,
-            _ => AudioFormat::Ds2Sp,
-        });
+        return Some(ds2_format(detect_ds2_format_type(data, audio_start(data, 0x600))));
     }
     if let Some(header_size) = ds2_header_size(data) {
         let start = audio_start(data, header_size);
         if data.len() < start + DS2_BLOCK_HEADER_SIZE {
             return None;
         }
-        let format_type = detect_ds2_format_type(data, start);
-        return Some(match format_type {
-            7 => AudioFormat::Ds2Qp7,
-            6 => AudioFormat::Ds2Qp,
-            _ => AudioFormat::Ds2Sp,
-        });
+        return Some(ds2_format(detect_ds2_format_type(data, start)));
     }
     None
+}
+
+fn ds2_format(format_type: u8) -> AudioFormat {
+    match format_type {
+        7 => AudioFormat::Ds2Qp7,
+        6 => AudioFormat::Ds2Qp,
+        2 | 4 => AudioFormat::Ds2Lp,
+        _ => AudioFormat::Ds2Sp,
+    }
 }
 
 pub(crate) fn ds2_header_size(data: &[u8]) -> Option<usize> {
@@ -330,10 +337,15 @@ mod tests {
         let mut data = make_ds2_with_header_blocks(6, 6, 0);
         data[1..4].copy_from_slice(b"dss");
         assert_eq!(detect_format(&data), Some(AudioFormat::GrundigSp));
-        for codec in [1u8, 2, 6, 0xff] {
+        for codec in [1u8, 2, 4, 6, 0xff] {
             data[6 * 512 + 3] = 0xff;
             data[6 * 512 + 4] = codec;
-            assert_eq!(detect_format(&data), Some(AudioFormat::DssSp));
+            let format = if codec == 2 || codec == 4 {
+                AudioFormat::DssLp
+            } else {
+                AudioFormat::DssSp
+            };
+            assert_eq!(detect_format(&data), Some(format));
             assert_eq!(sp_codec(&data), Some(codec));
             assert_eq!(detect_format(&data[..6 * 512 + 5]), Some(AudioFormat::GrundigSp));
             data[6 * 512 + 2] = 0;
@@ -348,6 +360,22 @@ mod tests {
             assert_eq!(dss_header_size(prefix), None);
         }
         assert_eq!(detect_format(b"\x08dsx"), None);
+    }
+
+    #[test]
+    fn detect_format_names_lp_files() {
+        for codec in [2u8, 4] {
+            let data = make_ds2_with_header_blocks(3, 3, codec);
+            assert_eq!(detect_format(&data), Some(AudioFormat::Ds2Lp));
+            assert_eq!(detect_format(&make_ds2_like_file(*b"\x03enc", codec)), Some(AudioFormat::Ds2Lp));
+            let mut dss = make_ds2_with_header_blocks(2, 2, codec);
+            dss[1..4].copy_from_slice(b"dss");
+            assert_eq!(detect_format(&dss), Some(AudioFormat::DssLp));
+        }
+        assert_eq!(AudioFormat::DssLp.native_sample_rate(), 8000);
+        assert_eq!(AudioFormat::Ds2Lp.native_sample_rate(), 8000);
+        assert_eq!(AudioFormat::DssLp.extension(), "dss");
+        assert_eq!(AudioFormat::Ds2Lp.extension(), "ds2");
     }
 
     #[test]

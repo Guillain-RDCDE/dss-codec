@@ -118,12 +118,13 @@ two encrypted files decode with the password test1234.
 Before we wrote each md5 we checked that FFmpeg, built from the
 dssds2-v13 series, decodes the file to the same samples. For a file
 whose rate changes, FFmpeg's output at each part's rate holds that part
-unresampled, and we compared the part there. Two kinds of file differ
-from FFmpeg built from the dssds2-v13 series:
+unresampled, and we compared the part there. The LP part of
+ds2/olympus-qp7-lp.ds2 and ds2/olympus-qp7-lp-empty109.ds2 we compared
+with FFmpeg's raw G.723.1 decoder instead, fed with the part's frames
+(ffmpeg -f g723_1). The 8 files with LP blocks also decode in pieces to
+the same parts as whole. One file differs from FFmpeg, and its test
+checks something else:
 
-- dss-codec has no LP decoder. It refuses the 8 files with LP blocks
-  with UnsupportedCodec(2) or UnsupportedCodec(4), and their tests
-  check that error. FFmpeg decodes them with its G.723.1 decoder.
 - ds2/paused-qp.ds2 holds subframes with a fixed codebook index of
   C(64,11) or more. dss-codec clamps such an index to C(64,11) - 1, as
   ODMS R8's DssDecoder.dll 1.1.1.0 does. FFmpeg from the dssds2-v13

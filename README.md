@@ -35,6 +35,7 @@ DSS_CODEC_PASSWORD=1234 ./target/release/dss-decode recording.DS2
 | `.dss` (v2/v3) | DSS SP | 12000 Hz | Header `{00..ff}dss`, byte4 is 0 or 1 |
 | `.ds2` mode 0-1 | DSS SP | 12000 Hz | Header `{01..ff}ds2`, byte4 is 0 or 1 |
 | `.ds2` mode 6-7 | DS2 QP | 16000 Hz | Header `{01..ff}ds2`, byte4 is 6 or 7 |
+| `.dss`, `.ds2` mode 2 or 4 | LP (G.723.1) | 8000 Hz | Header `{00..ff}dss` or `{01..ff}ds2`, byte4 is 2 or 4 |
 
 The first byte of a DS2 file, 0x01 to 0xff, is its header length in
 512-byte blocks. 0x01 means one block when byte 3 of the block at 0x200
@@ -52,9 +53,17 @@ block before any such block takes the format of the first block with
 frames in a known format. A run of blocks in one format is a part, and
 each part decodes with its own codec at its own rate. The first part
 starts at the first frame the decoder reads, and its format and rate are
-the file's. The decoder has no LP codec. An LP part fails with
-`UnsupportedCodec`, and so does a file in which no block with frames has
-byte 3 set to 0xff and a format byte in this list.
+the file's. A file in which no block with frames has byte 3 set to 0xff
+and a format byte in this list fails with `UnsupportedCodec`.
+
+LP blocks hold ITU-T G.723.1 frames, decoded at 8000 Hz. A frame is 24,
+20, 4 or 1 bytes long, as the two low bits of its first byte say: 6.3
+kbit/s, 5.3 kbit/s, comfort noise (SID) or no data. As with QP, frames
+run on from block to block and are not byte-swapped. Byte 2 of a block
+header counts the frames that start in the block, or byte 5 does in a
+pause block, and the anchor in bytes 0 and 1 is where the first of them
+starts. A frame that does not end at the next block's anchor is dropped,
+and reading resumes at the anchor.
 
 Some files hold a stale copy of their header blocks right after the
 header. A block there that starts with a "dss" or "ds2" header is such a
