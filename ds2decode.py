@@ -798,8 +798,10 @@ class DS2Decoder:
 
             gc = float(self.excitation_gain_table[sd['gain_idx']])
 
+            cb_max = math.comb(self.subframe_size, self.excitation_pulses) - 1
             positions = decode_combinatorial_index(
-                sd['cb_index'], self.subframe_size, self.excitation_pulses)
+                min(sd['cb_index'], cb_max), self.subframe_size,
+                self.excitation_pulses)
             fixed_exc = np.zeros(self.subframe_size)
             for pi, pos in enumerate(positions):
                 if pos < self.subframe_size:

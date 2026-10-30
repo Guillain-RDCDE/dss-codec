@@ -252,18 +252,13 @@ impl Ds2QpDecoder {
             }
 
             let gc = QP_EXCITATION_GAIN[*gain_idx];
-            // Misaligned frames in NCH selective-extraction cut files can carry
-            // a fixed-codebook index past C(64,11); the reference decoder then
-            // drops the first pulse and places the remaining ten at positions
-            // 9..0 (verified sample-exact against the NCH decodes).
-            let positions = if *cb_idx >= QP_COMB_MAX {
-                let mut p = Vec::with_capacity(EXCITATION_PULSES);
-                p.push(SUBFRAME_SIZE); // slot 0 dropped by the range guard below
-                p.extend((1..EXCITATION_PULSES).map(|i| EXCITATION_PULSES - 1 - i));
-                p
-            } else {
-                decode_combinatorial_index(*cb_idx, SUBFRAME_SIZE, EXCITATION_PULSES)
-            };
+            // An index of C(64,11) or more is clamped to C(64,11) - 1, which
+            // puts the pulses at positions 63..53.
+            let positions = decode_combinatorial_index(
+                (*cb_idx).min(QP_COMB_MAX - 1),
+                SUBFRAME_SIZE,
+                EXCITATION_PULSES,
+            );
             let mut fixed_exc = [0.0f64; SUBFRAME_SIZE];
             for (pi, &pos) in positions.iter().enumerate() {
                 if pos < SUBFRAME_SIZE {
@@ -352,6 +347,21 @@ mod tests {
             for p in 0..EXCITATION_PULSES {
                 fields.push((PULSE_BITS, ((p + sf) % 8) as u64));
             }
+        }
+        pack(&fields, 56)
+    }
+
+    fn qp_frame(cb_idx: u64) -> Vec<u8> {
+        let mut fields = Vec::new();
+        for i in 0..NUM_COEFFS {
+            fields.push((REFL_BIT_ALLOC[i], REFL[i] as u64));
+        }
+        for _ in 0..NUM_SUBFRAMES {
+            fields.push((PITCH_BITS, 0));
+            fields.push((PITCH_GAIN_BITS, 0));
+            fields.push((CB_BITS, cb_idx));
+            fields.push((GAIN_BITS, 30));
+            fields.extend([(PULSE_BITS, 7); EXCITATION_PULSES]);
         }
         pack(&fields, 56)
     }
@@ -458,5 +468,23 @@ mod tests {
             samples,
             decode_qp7(&mut Ds2QpDecoder::new(), vec![first, vec![0u8; 12]])
         );
+    }
+
+    #[test]
+    fn test_qp_index_from_comb_max_puts_pulses_at_63_to_53() {
+        let top: Vec<usize> = (53..64).rev().collect();
+        let expected = Ds2QpDecoder::new().decode_frame(&qp_frame(QP_COMB_MAX - 1));
+        for cb_idx in [QP_COMB_MAX, QP_COMB_MAX + 1, (1u64 << CB_BITS) - 1] {
+            let mut decoder = Ds2QpDecoder::new();
+            let samples = decoder.decode_frame(&qp_frame(cb_idx));
+            let start = decoder.pitch_memory.len() - SAMPLES_PER_FRAME;
+            let first = &decoder.pitch_memory[start..start + SUBFRAME_SIZE];
+            let positions: Vec<usize> = (0..SUBFRAME_SIZE)
+                .rev()
+                .filter(|&i| first[i] != 0.0)
+                .collect();
+            assert_eq!(positions, top);
+            assert_eq!(samples, expected);
+        }
     }
 }

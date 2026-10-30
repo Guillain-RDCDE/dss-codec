@@ -746,7 +746,7 @@ fn ds2_paused_qp() {
             92416,
             AudioFormat::Ds2Qp,
             6,
-            "af1e5cb2740e8c977b3bfcbf4b06f5d8",
+            "83bdf85ecd892238f954d5c2a1621e84",
         )],
     );
 }

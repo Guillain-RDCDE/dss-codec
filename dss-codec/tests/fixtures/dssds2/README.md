@@ -119,14 +119,16 @@ Before we wrote each md5 we checked that FFmpeg, built from the
 dssds2-v13 series, decodes the file to the same samples. For a file
 whose rate changes, FFmpeg's output at each part's rate holds that part
 unresampled, and we compared the part there. Two kinds of file differ
-from FFmpeg, and their tests check something else:
+from FFmpeg built from the dssds2-v13 series:
 
 - dss-codec has no LP decoder. It refuses the 8 files with LP blocks
   with UnsupportedCodec(2) or UnsupportedCodec(4), and their tests
   check that error. FFmpeg decodes them with its G.723.1 decoder.
 - ds2/paused-qp.ds2 holds subframes with a fixed codebook index of
-  C(64,11) or more. dss-codec decodes them with its own rule and FFmpeg
-  with another, so the md5 in its test is dss-codec's own decode.
+  C(64,11) or more. dss-codec clamps such an index to C(64,11) - 1, as
+  ODMS R8's DssDecoder.dll 1.1.1.0 does. FFmpeg from the dssds2-v13
+  series decodes the index as it stands, so its decode differs. FFmpeg
+  with the same clamp gives the md5 in the test.
 
 Both decoders refuse 4 files. olympus-format1-no-header.dss and
 olympus-qp-no-header.ds2 fail with UnsupportedFormat(15), and the two
