@@ -473,15 +473,25 @@ fn polynomial_step(p: &mut [i32; 6], x: i16, m: usize) {
     p[1] = shr32(add32(shr32(dep_hi(x), m as i16), p[1]), 1);
 }
 
+/// Entry `j mod 512` of the cosine table. The table holds one period, so
+/// this continues the cosine past both ends.
+fn cosine(j: i16) -> i16 {
+    COSINE[(j & 0x1ff) as usize]
+}
+
+/// About -2 cos of the LSP `q`, by linear interpolation in the cosine table.
+/// The stability step can leave an LSP below zero; the table is then read
+/// periodically, as cos(-x) = cos(x).
+fn lsp_cosine(q: i16) -> i16 {
+    let j = shr16(q, 7);
+    let delta = sub16(cosine(j + 1), cosine(j));
+    let fraction = add16(shl16(q & 0x7f, 8), 0x80);
+    let acc = shl32(mac32(dep_hi(cosine(j)), delta, fraction), 1);
+    neg16(round16(acc))
+}
+
 fn lsp_to_lpc(lsp: &[i16; ORDER]) -> [i16; ORDER] {
-    let mut c = [0i16; ORDER];
-    for (ck, &q) in c.iter_mut().zip(lsp) {
-        let j = shr16(q, 7) as usize;
-        let delta = sub16(COSINE[j + 1], COSINE[j]);
-        let fraction = add16(shl16(q & 0x7f, 8), 0x80);
-        let acc = shl32(mac32(dep_hi(COSINE[j]), delta, fraction), 1);
-        *ck = neg16(round16(acc));
-    }
+    let c = lsp.map(lsp_cosine);
 
     let start = |a: i16, b: i16| {
         [
@@ -1422,8 +1432,12 @@ mod tests {
     }
 
     fn high_rate_frame(lag0_code: u32, gain0: u32) -> Vec<u8> {
+        high_rate_frame_with_lsp(0x00ab_cdef, lag0_code, gain0)
+    }
+
+    fn high_rate_frame_with_lsp(lsp: u32, lag0_code: u32, gain0: u32) -> Vec<u8> {
         let mut w = BitWriter::new();
-        w.put(0, 2).put(0x00ab_cdef, 24);
+        w.put(0, 2).put(lsp, 24);
         w.put(lag0_code, 7).put(2, 2).put(100, 7).put(3, 2);
         for gain in [gain0, 0x123, 0x456, 0x789] {
             w.put(gain, 12);
@@ -1622,6 +1636,83 @@ mod tests {
         assert_eq!(empty.decode_frame(&[]), erased.decode_erased());
         // With no speech before it, concealment has nothing to repeat.
         assert_eq!(G7231Decoder::new().decode_erased(), [0; FRAME_SAMPLES]);
+    }
+
+    /// The cosine of an LSP, computed the other way: the unsigned 16-bit
+    /// pattern of q gives the table index mod 512 and the fraction.
+    fn lsp_cosine_unsigned(q: i16) -> i16 {
+        let u = q as u16;
+        let j = usize::from(u >> 7);
+        let low = COSINE[j];
+        let high = COSINE[(j + 1) % 512];
+        let fraction = add16(shl16((u & 0x7f) as i16, 8), 0x80);
+        let acc = shl32(mac32(dep_hi(low), sub16(high, low), fraction), 1);
+        neg16(round16(acc))
+    }
+
+    #[test]
+    fn lsp_cosine_reads_the_table_periodically() {
+        for q in i16::MIN..=i16::MAX {
+            assert_eq!(lsp_cosine(q), lsp_cosine_unsigned(q), "{q}");
+        }
+        // -2 cos(0) and -2 cos(pi), about, in the scale of the conversion.
+        assert_eq!(lsp_cosine(0), -32767);
+        assert_eq!(lsp_cosine(-1), lsp_cosine(0));
+        // The top of the int16 range reads entries 255 and 256.
+        assert_eq!(lsp_cosine(i16::MAX), lsp_cosine_unsigned(i16::MAX));
+    }
+
+    #[test]
+    fn decodes_frames_that_drive_an_lsp_below_zero() {
+        // Band 0 entry 0x43 with the band 1 and 2 entries 0: the first LSP
+        // goes below zero on the fourth frame and settles at -26, and the
+        // conversion reads the cosine table at index -1.
+        let frame = high_rate_frame_with_lsp(0x0043_0000, 40, 100);
+        let mut decoder = G7231Decoder::new();
+        let mut samples = Vec::new();
+        let mut lowest = i16::MAX;
+        for _ in 0..8 {
+            samples.extend(decoder.decode_frame(&frame));
+            lowest = lowest.min(decoder.prev_lsp[0]);
+        }
+        assert_eq!(lowest, -26);
+        let checksum: i64 = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (i as i64 + 1) * i64::from(s))
+            .sum();
+        // FFmpeg's G.723.1 decoder gives the same samples.
+        assert_eq!(checksum, 7318052758);
+    }
+
+    /// Frames of random bytes of every type, cut short, empty or erased,
+    /// with the postfilter on and off: the decoder never panics.
+    #[test]
+    fn random_bytes_never_panic() {
+        let mut state: u32 = 0x1234_5678;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (state >> 16) as u8
+        };
+        let mut on = G7231Decoder::new();
+        let mut off = G7231Decoder::with_postfilter(false);
+        for _ in 0..4000 {
+            let kind = next() & 3;
+            let mut frame: Vec<u8> = (0..frame_size(kind)).map(|_| next()).collect();
+            frame[0] = frame[0] & !3 | kind;
+            match next() % 16 {
+                0 => frame.clear(),
+                1 => frame.truncate(usize::from(next()) % frame.len()),
+                _ => {}
+            }
+            if next() % 20 == 0 {
+                on.decode_erased();
+                off.decode_erased();
+            } else {
+                on.decode_frame(&frame);
+                off.decode_frame(&frame);
+            }
+        }
     }
 
     #[test]
