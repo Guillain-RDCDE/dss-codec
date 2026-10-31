@@ -20,11 +20,10 @@ const BLOCK_MAX_FRAMES: u8 = 13;
 pub(crate) type TaggedFrames = Vec<(u8, Vec<u8>)>;
 
 /// Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff,
-/// and none when that is 0xff. Philips's decoder takes a block that states
-/// more than 13 as empty, which drops the DS-2600's splice blocks that state
-/// 19. So does this one, except where the block's format counts, 0xff in byte
-/// 3, and is variable rate SP, LP or QP7, whose frames can be short enough for
-/// more to start in a block.
+/// and none when that is 0xff. A block that states more than 13 holds none,
+/// which drops the DS-2600's splice blocks that state 19, except where the
+/// block's format counts, 0xff in byte 3, and is variable rate SP, LP or QP7,
+/// whose frames can be short enough for more to start in a block.
 pub(crate) fn block_frames(header: &[u8]) -> usize {
     let count = if header[2] != 0 && header[2] != 0xff {
         header[2]

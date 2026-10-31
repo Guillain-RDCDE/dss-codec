@@ -151,10 +151,10 @@ from FFmpeg built from the dssds2-v13 series:
   with UnsupportedCodec(2) or UnsupportedCodec(4), and their tests
   check that error. FFmpeg decodes them with its G.723.1 decoder.
 - ds2/paused-qp.ds2 holds subframes with a fixed codebook index of
-  C(64,11) or more. dss-codec clamps such an index to C(64,11) - 1, as
-  ODMS R8's DssDecoder.dll 1.1.1.0 does. FFmpeg from the dssds2-v13
-  series decodes the index as it stands, so its decode differs. FFmpeg
-  with the same clamp gives the md5 in the test.
+  C(64,11) or more. dss-codec clamps such an index to C(64,11) - 1.
+  FFmpeg from the dssds2-v13 series decodes the index as it stands, so
+  its decode differs. FFmpeg with the same clamp gives the md5 in the
+  test.
 
 Both decoders refuse 2 files. olympus-format1-no-header.dss and
 olympus-qp-no-header.ds2 fail with UnsupportedFormat(15), and their

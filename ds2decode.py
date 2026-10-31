@@ -206,9 +206,9 @@ DSS_SP_PACKET_SIZE = 42
 
 def _block_frames(block_header):
     """Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff.
-    A block that states more than 13 holds none, as in Philips's decoder, except
-    where byte 3 is 0xff and byte 4 is variable rate SP, LP or QP7, whose frames
-    can be short enough for more."""
+    A block that states more than 13 holds none, except where byte 3 is 0xff
+    and byte 4 is variable rate SP, LP or QP7, whose frames can be short enough
+    for more."""
     fc = block_header[2]
     if fc in (0, 0xff):
         fc = block_header[5]
@@ -221,7 +221,9 @@ def _block_frames(block_header):
 def _block_start_bits(block_header):
     """Bit offset of a block's first frame from the block start: byte 1 and the
     top half of byte 0, or where both are 0 (Philips pause blocks), the bottom
-    half of byte 0 and byte 3, rounded down to a whole byte."""
+    half of byte 0 and byte 3 rounded down to a whole byte. Only the second
+    form is rounded. The callers take the offset >> 3, so the low 3 bits of
+    the first form never count."""
     bits = (block_header[1] << 4) | (block_header[0] >> 4)
     if bits == 0:
         bits = (((block_header[0] & 0x0f) << 8) | block_header[3]) & ~7

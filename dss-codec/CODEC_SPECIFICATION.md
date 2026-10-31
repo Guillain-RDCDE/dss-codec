@@ -944,10 +944,7 @@ The positions are in descending order because the combinatorial encoding maps th
 A valid QP fixed-codebook index is always `< C(64, 11) = 743,595,781,824`.
 The 40-bit field can hold a larger value, which the normal decode cannot
 represent. The decoder clamps such an index to `C(64, 11) - 1`, which puts
-the 11 pulses at positions 63 down to 53. ODMS R8's DssDecoder.dll
-1.1.1.0 and Philips PSPGRU.ACM 14.0.480.33 do the same. The older Olympus
-dss32.dll (2007) does not: it drops the first pulse and puts the other
-ten at positions 9 down to 0.
+the 11 pulses at positions 63 down to 53.
 
 ```python
 QP_COMB_MAX = 743_595_781_824   # C(64, 11)
