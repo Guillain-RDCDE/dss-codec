@@ -205,11 +205,17 @@ class SPBitstreamReader:
 DSS_SP_PACKET_SIZE = 42
 
 def _block_frames(block_header):
-    """Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff."""
+    """Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff.
+    A block that states more than 13 holds none, as in Philips's decoder, except
+    where byte 3 is 0xff and byte 4 is variable rate SP, LP or QP7, whose frames
+    can be short enough for more."""
     fc = block_header[2]
     if fc in (0, 0xff):
         fc = block_header[5]
-    return 0 if fc == 0xff else fc
+    if fc == 0xff or (fc > 13 and not (block_header[3] == 0xff
+                                       and block_header[4] in (1, 2, 4, 7))):
+        return 0
+    return fc
 
 
 def _block_start_bits(block_header):

@@ -1,6 +1,6 @@
 # DSS and DS2 test fixtures
 
-tests/fixtures_dssds2.rs decodes each of these 67 files. They are the
+tests/fixtures_dssds2.rs decodes each of these 70 files. They are the
 DSS and DS2 samples of FFmpeg's FATE set for the dssds2-v13 series whose
 source we know and may share. ../grundig_sample.dss is that set's
 dss/grundig-sp.dss, so this directory does not repeat it.
@@ -22,17 +22,24 @@ ds2/paused-qp.ds2 is Guillain d'Erceville's. He contributed it to FFmpeg
 under CC0. It holds QP with a re-sync block and scrubbed audio, and it
 ends inside a frame.
 
-The two philips-pause files, and the file made from one of them, hold
-other speech. Each philips-pause file is the first 700 frames of an R8
-encode of test01_20s.wav from the voxserv audio_quality_testing_samples
-set, QP in the .ds2 file and SP in the .dss file. Three of its block
-headers come from a list of pause blocks that Philips recorders write:
-the block before, the pause block and the block after. A pause block
-gives its first frame as a bit offset in the bottom half of byte 0 and
-in byte 3, and its frame count in byte 5. The frames sit where
-Philips's reader looks for them. olympus-sp-byte2-ff.dss has 0xff in
-byte 2 of one block and that block's count in byte 5, which Philips's
-reader also takes.
+The two philips-pause files, olympus-qp-count19.ds2 and the files made
+from them hold other speech. Each of those three is the first 700
+frames of an R8 encode of test01_20s.wav from the voxserv
+audio_quality_testing_samples set, QP in the .ds2 files and SP in the
+.dss file. In a philips-pause file, three block headers come from a
+list of pause blocks that Philips recorders write: the block before,
+the pause block and the block after. A pause block gives its first
+frame as a bit offset in the bottom half of byte 0 and in byte 3, and
+its frame count in byte 5. The frames sit where Philips's reader looks
+for them. olympus-sp-byte2-ff.dss has 0xff in byte 2 of one block and
+that block's count in byte 5, which Philips's reader also takes. In
+olympus-qp-count19.ds2 the middle block states 19 frames and holds 9,
+like block 28 of paused-qp.ds2. olympus-qp-count19-byte3.ds2 is the
+same file with 0 in byte 3 and 7 in byte 4 of that block. Its byte 4
+does not count, so the limit of 13 applies, and the file decodes like
+olympus-qp-count19.ds2. olympus-sp-count19.dss is
+olympus-sp-philips-pause.dss with one block that states 19 frames and
+holds 12. Format 0 gets the limit too, so that block holds no frames.
 
 Formats: 0 is SP, 1 variable rate SP, 2 and 4 LP, 6 QP and 7 QP7. "3 s
 SP" and the like name the plain 3 s encode of that format. Block numbers
@@ -55,6 +62,7 @@ count audio blocks from 0, from the first block after the file header.
 | dss/olympus-sp-byte2-ff.dss | olympus-sp-philips-pause.dss | audio block 31 set to 0f 15 ff ff 00 0c, its 12 frames in byte 5 |
 | dss/olympus-sp-byte3-mid.dss | 3 s SP | 6th audio block: byte 3 set to 0, byte 4 to 2 |
 | dss/olympus-sp-byte3-none.dss | 3 s SP | byte 3 set to 0 in every audio block |
+| dss/olympus-sp-count19.dss | olympus-sp-philips-pause.dss | audio block 31 set to 0f 15 13 ff 00 ff, 19 frames stated, 12 held |
 | dss/olympus-sp-empty56.dss | 3 s SP | 56 empty SP blocks in front |
 | dss/olympus-sp-empty-lp.dss | 3 s SP | an empty LP block in front, 0x2a4 set to 0xff |
 | dss/olympus-sp-format3-first.dss | 3 s SP | format byte of the first audio block set to 3 |
@@ -83,6 +91,8 @@ count audio blocks from 0, from the first block after the file header.
 | ds2/olympus-qp-byte3-mid.ds2 | 3 s QP | 11th audio block: byte 3 set to 0, byte 4 to 7 |
 | ds2/olympus-qp-byte3-none.ds2 | 3 s QP | byte 3 set to 0 in every audio block |
 | ds2/olympus-qp-byte3-sp-first.ds2 | 3 s QP | 1st audio block: byte 3 set to 0, byte 4 to 0 |
+| ds2/olympus-qp-count19.ds2 | 700 frames of a QP encode of test01 | audio blocks 41 to 43 are 0f 12 09 ff 06 ff, 0f 11 13 ff 06 ff and 0f 1b 09 ff 06 ff, as at a DS-2600 splice |
+| ds2/olympus-qp-count19-byte3.ds2 | olympus-qp-count19.ds2 | audio block 42: byte 3 set to 0, byte 4 to 7 |
 | ds2/olympus-qp-cut.ds2 | 3 s QP | cut 300 bytes into its 13th audio block |
 | ds2/olympus-qp-format3-first.ds2 | 3 s QP | format byte of the first audio block set to 3 |
 | ds2/olympus-qp-hdr1.ds2 | 3 s QP | R8 set to 1 header block |

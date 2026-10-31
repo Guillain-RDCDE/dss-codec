@@ -546,12 +546,12 @@ mod tests {
 
     #[test]
     fn test_grundig_overstated_count_reads_into_next_block() {
-        let data = [block(0x00, 3, 14, 1), block(0x80, 16, 1, 2)].concat();
+        let data = [block(0x00, 10, 13, 1), block(0x80, 16, 1, 2)].concat();
         let bits = payload_bits(&data);
 
         let (frames, total) = demux_grundig(&data).unwrap();
-        assert_eq!(total, 15);
-        let mut expected = frames_from(&bits, 14);
+        assert_eq!(total, 14);
+        let mut expected: Vec<Vec<u8>> = (0..13).map(|k| frame_at(&bits, 112 + k * FRAME_BITS)).collect();
         expected.push(frame_at(&bits, 4048 + 216));
         assert_eq!(frames, expected);
     }

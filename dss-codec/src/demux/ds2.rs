@@ -571,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_ds2_sp_demux_overdeclared_frames_stop_at_end_of_file() {
-        let data = make_ds2_file(0, 14, 0x20);
+        let data = make_ds2_file(0, 13, 0x20);
         let packets = sp_packets(&data);
         assert_eq!(packets.len(), 12);
         assert!(packets.iter().all(|p| p.len() == 42));
@@ -871,10 +871,28 @@ mod tests {
     #[test]
     fn test_ds2_qp_overstated_count_stops_at_block_end() {
         let data = qp_file(&[
-            qp_block(anchor_byte(0), 19, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(0), 13, 0xff, 6, &stream_bytes(0, 506)),
             qp_block(anchor_byte(54), 1, 0xff, 6, &stream_bytes(506, 506)),
         ]);
         assert_eq!(qp_frames_of(&data), stream_frames(11));
+    }
+
+    #[test]
+    fn test_ds2_qp_block_over_13_frames_is_empty() {
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            qp_block(anchor_byte(54), 19, 0xff, 6, &stream_bytes(506, 506)),
+            qp_block(anchor_byte(48), 1, 0xff, 6, &stream_bytes(1012, 506)),
+        ]);
+        let mut expected = stream_frames(10);
+        expected.push(stream_bytes(1012 + 48, DS2_QP_FRAME_SIZE));
+        assert_eq!(qp_frames_of(&data), expected);
+
+        let mut qp7 = data.clone();
+        for block in 0..3 {
+            qp7[(3 + block) * DS2_BLOCK_SIZE + 4] = 7;
+        }
+        assert!(qp_frames_of(&qp7).len() > expected.len());
     }
 
     #[test]
