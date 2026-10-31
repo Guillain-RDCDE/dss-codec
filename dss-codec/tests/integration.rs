@@ -74,7 +74,7 @@ fn test_detect_grundig_sp() {
 
 /// The 3:4 polyphase playback FIR from 12 kHz to 16 kHz: 100 taps per phase,
 /// one extra tap on phase 0, and 0xce zero samples of history.
-fn dss2wav_fir(inp: &[f64]) -> Vec<i16> {
+fn playback_fir(inp: &[f64]) -> Vec<i16> {
     use dss_codec::tables::grundig_sp::RESAMP;
     const HIST: usize = 0xce;
     let mut x = vec![0.0f64; HIST];
@@ -159,8 +159,8 @@ fn test_decode_grundig_sp_bit_exact() {
     let reference = wav_samples(reference);
     assert_eq!(reference.len(), 151 * 384);
     assert!(
-        dss2wav_fir(&pcm12) == reference,
-        "decode through the dss2wav FIR differs from the reference"
+        playback_fir(&pcm12) == reference,
+        "decode through the playback FIR differs from the reference"
     );
 
     let _ = std::fs::remove_file(&in_path);

@@ -11,12 +11,12 @@ dss/grundig-sp.dss, so this directory does not repeat it.
 Wordsworth, read for LibriVox. The archive.org item is
 shortpoetry_026_librivox, and the reading is in the public domain. We
 took 20.0 to 30.0 s of it, resampled it to the rate each mode takes, and
-encoded it with DssEncoder.dll and DssWriter.dll from OM System's ODMS
-R8, in trial mode, under Wine. The 10 s encodes are olympus-sp,
-olympus-format1, olympus-lp and olympus-qp7. The other encodes hold the
-first 3 s. DssRawWriter.dll from R8 wrote the files whose format changes
-and the two encrypted files. The password of both is test1234. We made
-the rest by hand from these encodes, as the table says.
+encoded it with the encoder and writer of Olympus ODMS R8, in trial
+mode. The 10 s encodes are olympus-sp, olympus-format1, olympus-lp and
+olympus-qp7. The other encodes hold the first 3 s. A second R8 writer
+wrote the files whose format changes and the two encrypted files. The
+password of both is test1234. We made the rest by hand from these
+encodes, as the table says.
 
 ds2/paused-qp.ds2 is Guillain d'Erceville's. He contributed it to FFmpeg
 under CC0. It holds QP with a re-sync block and scrubbed audio, and it
@@ -30,9 +30,10 @@ audio_quality_testing_samples set, QP in the .ds2 files and SP in the
 list of pause blocks that Philips recorders write: the block before,
 the pause block and the block after. A pause block gives its first
 frame as a bit offset in the bottom half of byte 0 and in byte 3, and
-its frame count in byte 5. The frames sit where Philips's reader looks
-for them. olympus-sp-byte2-ff.dss has 0xff in byte 2 of one block and
-that block's count in byte 5, which Philips's reader also takes. In
+its frame count in byte 5. The frames sit at that offset, as many as
+the count says. olympus-sp-byte2-ff.dss has 0xff in byte 2 of one block
+and that block's count in byte 5. A block with 0 or 0xff in byte 2
+takes its count from byte 5. In
 olympus-qp-count19.ds2 the middle block states 19 frames and holds 9,
 like block 28 of paused-qp.ds2. olympus-qp-count19-byte3.ds2 is the
 same file with 0 in byte 3 and 7 in byte 4 of that block. Its byte 4
@@ -83,10 +84,10 @@ count audio blocks from 0, from the first block after the file header.
 | ds2/olympus-qp7.ds2 | 10 s QP7 encode | none |
 | ds2/olympus-qp7-empty64.ds2 | olympus-qp7.ds2 | 64 empty QP7 blocks in front |
 | ds2/olympus-qp7-empty-lp.ds2 | 3 s QP7 | an empty LP block in front |
-| ds2/olympus-qp7-lp.ds2 | 3 s QP7 and LP | DssRawWriter: 21 QP7 blocks, then 5 LP blocks |
+| ds2/olympus-qp7-lp.ds2 | 3 s QP7 and LP | second R8 writer: 21 QP7 blocks, then 5 LP blocks |
 | ds2/olympus-qp7-lp-empty109.ds2 | olympus-qp7-lp.ds2 | 109 empty QP7 blocks in front |
-| ds2/olympus-qp-aes-mode0.ds2 | 3 s QP | DssRawWriter: AES-128, key size 0 |
-| ds2/olympus-qp-aes256-mode0.ds2 | 3 s QP | DssRawWriter: AES-256, key size 0 |
+| ds2/olympus-qp-aes-mode0.ds2 | 3 s QP | second R8 writer: AES-128, key size 0 |
+| ds2/olympus-qp-aes256-mode0.ds2 | 3 s QP | second R8 writer: AES-256, key size 0 |
 | ds2/olympus-qp-annot.ds2 | 3 s QP | annotations at 0x400 |
 | ds2/olympus-qp-byte3-mid.ds2 | 3 s QP | 11th audio block: byte 3 set to 0, byte 4 to 7 |
 | ds2/olympus-qp-byte3-none.ds2 | 3 s QP | byte 3 set to 0 in every audio block |
@@ -101,7 +102,7 @@ count audio blocks from 0, from the first block after the file header.
 | ds2/olympus-qp-no-header.ds2 | 3 s QP | its 1536-byte header removed |
 | ds2/olympus-qp-pause-block.ds2 | 3 s QP | 6th audio block in pause form, its 9 frames in byte 5 |
 | ds2/olympus-qp-philips-pause.ds2 | 700 frames of a QP encode of test01 | audio blocks 39 to 41 are 0f 14 09 ff 06 ff, 01 00 00 c0 06 09 and 0f 1b 09 ff 06 ff |
-| ds2/olympus-qp-qp7.ds2 | 3 s QP and QP7 | DssRawWriter: 21 QP blocks, then 21 QP7 blocks |
+| ds2/olympus-qp-qp7.ds2 | 3 s QP and QP7 | second R8 writer: 21 QP blocks, then 21 QP7 blocks |
 | ds2/olympus-qp-qp7-format3.ds2 | olympus-qp-qp7.ds2 | 31st audio block, format 7 set to 3 |
 | ds2/olympus-qp-resync.ds2 | 3 s QP | byte 1 of the 5th audio block raised from 27 to 55 |
 | ds2/olympus-qp-tail-start.ds2 | 3 s QP | its first 6 audio blocks removed |
@@ -111,7 +112,7 @@ count audio blocks from 0, from the first block after the file header.
 | ds2/olympus-sp-empty-qp.ds2 | 3 s SP | an empty QP block in front |
 | ds2/olympus-sp-hdr1.ds2 | 3 s SP | R8 set to 1 header block |
 | ds2/olympus-sp-hdr17.ds2 | 3 s SP | R8 set to 17 header blocks |
-| ds2/olympus-sp-qp.ds2 | 3 s SP and QP | DssRawWriter: 11 SP blocks, then 21 QP blocks |
+| ds2/olympus-sp-qp.ds2 | 3 s SP and QP | second R8 writer: 11 SP blocks, then 21 QP blocks |
 | ds2/olympus-sp-qp-cut.ds2 | olympus-sp-qp.ds2 | SP blocks 7 to 11 removed |
 | ds2/olympus-sp-qp-format3.ds2 | olympus-sp-qp.ds2 | 21st audio block, format 6 set to 3 |
 | ds2/olympus-sp-qp-format3-first.ds2 | olympus-sp-qp.ds2 | 1st audio block, format 0 set to 3 |
@@ -163,8 +164,7 @@ tests check that error.
 A block's format counts only when byte 3 is 0xff and byte 4 names a
 known format. In a file where no block's format counts, every block is
 in the format of byte 4 of the first block with frames. So the two
-byte3-none files decode like the encodes they come from, as R8 decodes
-them.
+byte3-none files decode like the encodes they come from.
 FFmpeg with the same block header rules decodes them, the two
 philips-pause files and olympus-sp-byte2-ff.dss to the md5 in each test.
 
