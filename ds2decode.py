@@ -204,6 +204,29 @@ class SPBitstreamReader:
 
 DSS_SP_PACKET_SIZE = 42
 
+def _block_frames(block_header):
+    """Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff."""
+    fc = block_header[2]
+    if fc in (0, 0xff):
+        fc = block_header[5]
+    return 0 if fc == 0xff else fc
+
+
+def _block_start_bits(block_header):
+    """Bit offset of a block's first frame from the block start: byte 1 and the
+    top half of byte 0, or where both are 0 (Philips pause blocks), the bottom
+    half of byte 0 and byte 3, rounded down to a whole byte."""
+    bits = (block_header[1] << 4) | (block_header[0] >> 4)
+    if bits == 0:
+        bits = (((block_header[0] & 0x0f) << 8) | block_header[3]) & ~7
+    return bits
+
+
+def _block_anchor(block_header):
+    """Payload offset of a block's first frame."""
+    return max(0, (_block_start_bits(block_header) >> 3) - DS2_BLOCK_HEADER_SIZE)
+
+
 def _is_ds2_audio_block_header(block_header):
     if len(block_header) < DS2_BLOCK_HEADER_SIZE:
         return False
@@ -287,13 +310,14 @@ def read_ds2_file(path, password=None):
     format_type = 0
     for bi in range(num_blocks):
         bstart = header_size + bi * DS2_BLOCK_SIZE
-        if data[bstart + 2] > 0:
+        if _block_frames(data[bstart:bstart + DS2_BLOCK_HEADER_SIZE]) > 0:
             format_type = data[bstart + 4]
             break
 
     total_frames = 0
     for bi in range(num_blocks):
-        total_frames += data[header_size + bi * DS2_BLOCK_SIZE + 2]
+        bstart = header_size + bi * DS2_BLOCK_SIZE
+        total_frames += _block_frames(data[bstart:bstart + DS2_BLOCK_HEADER_SIZE])
 
     if format_type == 7:
         payload_size = DS2_BLOCK_SIZE - DS2_BLOCK_HEADER_SIZE  # 506
@@ -325,14 +349,14 @@ def read_ds2_file(path, password=None):
         for bi in range(num_blocks):
             bstart = header_size + bi * DS2_BLOCK_SIZE
             block_header = data[bstart:bstart + DS2_BLOCK_HEADER_SIZE]
-            fc = block_header[2]
+            fc = _block_frames(block_header)
             if fc == 0:
                 flush_segment()
                 zero_end = (bi + 1) * payload_size
                 raw_read_pos = max(raw_read_pos or 0, zero_end)
                 continue
 
-            payload_off = max(0, block_header[1] * 2 - DS2_BLOCK_HEADER_SIZE)
+            payload_off = _block_anchor(block_header)
             frames_raw_start = bi * payload_size + payload_off
             if raw_read_pos is None or raw_read_pos < frames_raw_start:
                 raw_read_pos = frames_raw_start
@@ -347,7 +371,7 @@ def read_ds2_file(path, password=None):
     if format_type >= 6:
         # QP mode: segmented bitstream with cut-point detection.
         #
-        # Byte 1 of every block header encodes a continuation offset:
+        # Byte 1 of an Olympus block header encodes a continuation offset:
         #   payload_off = b1*2 - DS2_BLOCK_HEADER_SIZE
         # The first payload_off bytes of each block's payload are the tail of a
         # frame that started in the previous block; the block's own frames begin
@@ -368,11 +392,10 @@ def read_ds2_file(path, password=None):
 
         for bi in range(num_blocks):
             bstart = header_size + bi * DS2_BLOCK_SIZE
-            b1 = data[bstart + 1]
-            fc = data[bstart + 2]
+            block_header = data[bstart:bstart + DS2_BLOCK_HEADER_SIZE]
+            fc = _block_frames(block_header)
 
-            cont_bytes = b1 * 2
-            payload_off = max(0, cont_bytes - DS2_BLOCK_HEADER_SIZE)
+            payload_off = _block_anchor(block_header)
             frames_raw_start = bi * payload_size + payload_off
 
             if bi == 0:
@@ -411,7 +434,7 @@ def read_ds2_file(path, password=None):
             bstart = header_size + bi * DS2_BLOCK_SIZE
             stream.extend(data[bstart + DS2_BLOCK_HEADER_SIZE:bstart + DS2_BLOCK_SIZE])
 
-        swap = (data[header_size] >> 7) & 1
+        swap = (_block_start_bits(data[header_size:header_size + DS2_BLOCK_HEADER_SIZE]) >> 3) & 1
         swap_byte = 0
         pos = 0
         frame_packets = []

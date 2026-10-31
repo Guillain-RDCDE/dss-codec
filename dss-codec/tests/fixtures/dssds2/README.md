@@ -1,6 +1,6 @@
 # DSS and DS2 test fixtures
 
-tests/fixtures_dssds2.rs decodes each of these 64 files. They are the
+tests/fixtures_dssds2.rs decodes each of these 67 files. They are the
 DSS and DS2 samples of FFmpeg's FATE set for the dssds2-v13 series whose
 source we know and may share. ../grundig_sample.dss is that set's
 dss/grundig-sp.dss, so this directory does not repeat it.
@@ -22,8 +22,21 @@ ds2/paused-qp.ds2 is Guillain d'Erceville's. He contributed it to FFmpeg
 under CC0. It holds QP with a re-sync block and scrubbed audio, and it
 ends inside a frame.
 
+The two philips-pause files, and the file made from one of them, hold
+other speech. Each philips-pause file is the first 700 frames of an R8
+encode of test01_20s.wav from the voxserv audio_quality_testing_samples
+set, QP in the .ds2 file and SP in the .dss file. Three of its block
+headers come from a list of pause blocks that Philips recorders write:
+the block before, the pause block and the block after. A pause block
+gives its first frame as a bit offset in the bottom half of byte 0 and
+in byte 3, and its frame count in byte 5. The frames sit where
+Philips's reader looks for them. olympus-sp-byte2-ff.dss has 0xff in
+byte 2 of one block and that block's count in byte 5, which Philips's
+reader also takes.
+
 Formats: 0 is SP, 1 variable rate SP, 2 and 4 LP, 6 QP and 7 QP7. "3 s
-SP" and the like name the plain 3 s encode of that format.
+SP" and the like name the plain 3 s encode of that format. Block numbers
+count audio blocks from 0, from the first block after the file header.
 
 | File | Made from | Edit or setting |
 |------|-----------|-----------------|
@@ -39,6 +52,7 @@ SP" and the like name the plain 3 s encode of that format.
 | dss/olympus-format1-noswap-prev4-empty62.dss | olympus-format1-noswap-prev.dss | the empty block ends with 4 bytes of the stream, 62 empty blocks in front |
 | dss/olympus-lp-format4.dss | 3 s LP | R8 set to output media type 4 |
 | dss/olympus-lp-format-sp.dss | 3 s LP | 0x2a4 set to 0 |
+| dss/olympus-sp-byte2-ff.dss | olympus-sp-philips-pause.dss | audio block 31 set to 0f 15 ff ff 00 0c, its 12 frames in byte 5 |
 | dss/olympus-sp-byte3-mid.dss | 3 s SP | 6th audio block: byte 3 set to 0, byte 4 to 2 |
 | dss/olympus-sp-byte3-none.dss | 3 s SP | byte 3 set to 0 in every audio block |
 | dss/olympus-sp-empty56.dss | 3 s SP | 56 empty SP blocks in front |
@@ -49,6 +63,7 @@ SP" and the like name the plain 3 s encode of that format.
 | dss/olympus-sp-hdr1.dss | 3 s SP | first byte set to 1 |
 | dss/olympus-sp-no-date.dss | 3 s SP | the 24 date bytes from 0x26 set to 0xff |
 | dss/olympus-sp-pause-block.dss | 3 s SP | 6th audio block in pause form, its 13 frames in byte 5 |
+| dss/olympus-sp-philips-pause.dss | 700 frames of an SP encode of test01 | audio blocks 15 to 17 are 0f 15 0c ff 00 ff, 01 00 00 78 00 0c and 8f 10 0c ff 00 ff |
 | dss/olympus-sp-swap-start.dss | 3 s SP | its first 6 audio blocks removed |
 | ds2/olympus-format1.ds2 | 10 s format 1 encode | none |
 | ds2/olympus-format1-annot.ds2 | olympus-format1.ds2 | annotations at 0x400 |
@@ -75,6 +90,7 @@ SP" and the like name the plain 3 s encode of that format.
 | ds2/olympus-qp-header-copy.ds2 | 3 s QP | R8 header copy, 3 header blocks, version 1 |
 | ds2/olympus-qp-no-header.ds2 | 3 s QP | its 1536-byte header removed |
 | ds2/olympus-qp-pause-block.ds2 | 3 s QP | 6th audio block in pause form, its 9 frames in byte 5 |
+| ds2/olympus-qp-philips-pause.ds2 | 700 frames of a QP encode of test01 | audio blocks 39 to 41 are 0f 14 09 ff 06 ff, 01 00 00 c0 06 09 and 0f 1b 09 ff 06 ff |
 | ds2/olympus-qp-qp7.ds2 | 3 s QP and QP7 | DssRawWriter: 21 QP blocks, then 21 QP7 blocks |
 | ds2/olympus-qp-qp7-format3.ds2 | olympus-qp-qp7.ds2 | 31st audio block, format 7 set to 3 |
 | ds2/olympus-qp-resync.ds2 | 3 s QP | byte 1 of the 5th audio block raised from 27 to 55 |
@@ -130,10 +146,17 @@ from FFmpeg built from the dssds2-v13 series:
   series decodes the index as it stands, so its decode differs. FFmpeg
   with the same clamp gives the md5 in the test.
 
-Both decoders refuse 4 files. olympus-format1-no-header.dss and
-olympus-qp-no-header.ds2 fail with UnsupportedFormat(15), and the two
-byte3-none files with UnsupportedCodec(255). Their tests check that
-error.
+Both decoders refuse 2 files. olympus-format1-no-header.dss and
+olympus-qp-no-header.ds2 fail with UnsupportedFormat(15), and their
+tests check that error.
+
+A block's format counts only when byte 3 is 0xff and byte 4 names a
+known format. In a file where no block's format counts, every block is
+in the format of byte 4 of the first block with frames. So the two
+byte3-none files decode like the encodes they come from, as R8 decodes
+them.
+FFmpeg with the same block header rules decodes them, the two
+philips-pause files and olympus-sp-byte2-ff.dss to the md5 in each test.
 
 ## Regenerating a reference
 

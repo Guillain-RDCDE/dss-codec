@@ -4,7 +4,9 @@
 /// QP mode (6): 56-byte frames, read from each block's anchor and across
 /// block boundaries.
 /// QP7 mode (7): the same, with 12-byte noise frames where the type bit is 0.
-use crate::demux::dss::{block_frames, dss_single_part, header_format, part_format, TaggedFrames};
+use crate::demux::dss::{
+    block_frames, block_start_bits, dss_single_part, header_format, part_format, TaggedFrames,
+};
 use crate::demux::{audio_start, check_sp_codec, ds2_header_size};
 use crate::error::{DecodeError, Result};
 
@@ -29,6 +31,8 @@ pub struct Ds2Qp7Segment {
     pub reset_before: bool,
 }
 
+/// The format of the first block with frames whose format counts, or where
+/// no block's does, byte 4 of the first block with frames.
 pub(crate) fn find_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
     let mut unknown = None;
     let mut bstart = header_size;
@@ -39,15 +43,25 @@ pub(crate) fn find_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8
             if part_format(format).is_some() {
                 return Some(format);
             }
-            unknown = unknown.or(Some(format));
+            unknown = unknown.or(Some(hdr[4]));
         }
         bstart += DS2_BLOCK_SIZE;
     }
     unknown
 }
 
+/// The format of the first block with frames whose format counts.
 pub(crate) fn known_ds2_format_type(data: &[u8], header_size: usize) -> Option<u8> {
-    find_ds2_format_type(data, header_size).filter(|format| part_format(*format).is_some())
+    let mut bstart = header_size;
+    while bstart + DS2_BLOCK_HEADER_SIZE <= data.len() {
+        let hdr = &data[bstart..bstart + DS2_BLOCK_HEADER_SIZE];
+        let format = header_format(hdr);
+        if block_frames(hdr) > 0 && part_format(format).is_some() {
+            return Some(format);
+        }
+        bstart += DS2_BLOCK_SIZE;
+    }
+    None
 }
 
 pub(crate) fn detect_ds2_format_type(data: &[u8], header_size: usize) -> u8 {
@@ -164,7 +178,7 @@ pub fn demux_ds2(data: &[u8]) -> Result<DemuxedDs2> {
 }
 
 pub(crate) fn block_anchor(hdr: &[u8]) -> usize {
-    (2 * hdr[1] as usize + 2 * (hdr[0] >> 7) as usize)
+    (block_start_bits(hdr) >> 3)
         .saturating_sub(DS2_BLOCK_HEADER_SIZE)
         .min(DS2_BLOCK_PAYLOAD_SIZE)
 }
@@ -518,6 +532,7 @@ mod tests {
         data[1..4].copy_from_slice(b"ds2");
 
         let mut block = [0u8; DS2_BLOCK_SIZE];
+        block[1] = 3;
         block[2] = frame_count;
         block[3] = 0xff;
         block[4] = mode;
@@ -607,6 +622,25 @@ mod tests {
         assert_eq!(find_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), None);
         assert_eq!(detect_ds2_format_type(&data[..cut], 3 * DS2_BLOCK_SIZE), 0);
         assert_eq!(find_ds2_format_type(&data[..100], 3 * DS2_BLOCK_SIZE), None);
+    }
+
+    #[test]
+    fn test_find_ds2_format_type_without_a_qualifying_block() {
+        let mut data = make_ds2_file(7, 2, 0x10);
+        let second = make_ds2_file(6, 2, 0x10);
+        data.extend_from_slice(&second[3 * DS2_BLOCK_SIZE..]);
+        data[3 * DS2_BLOCK_SIZE + 3] = 0;
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(6));
+        assert_eq!(known_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(6));
+
+        data[4 * DS2_BLOCK_SIZE + 3] = 0;
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(7));
+        assert_eq!(known_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), None);
+        assert_eq!(detect_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), 7);
+
+        data[3 * DS2_BLOCK_SIZE + 4] = 5;
+        assert_eq!(find_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), Some(5));
+        assert_eq!(known_ds2_format_type(&data, 3 * DS2_BLOCK_SIZE), None);
     }
 
     #[test]
@@ -799,6 +833,39 @@ mod tests {
         assert_eq!(find_ds2_format_type(&pause, 3 * DS2_BLOCK_SIZE), Some(6));
         assert_eq!(qp_frames_of(&pause), stream_frames(3));
         assert_eq!(qp_frames_of(&pause), qp_frames_of(&counted));
+    }
+
+    #[test]
+    fn test_block_anchor_reads_byte3_when_pointer_is_0() {
+        for (header, anchor) in [
+            ([0x0f, 0x05, 0x09, 0xff, 0x06, 0xff], 4),
+            ([0x0f, 0x05, 0x09, 0x40, 0x06, 0xff], 4),
+            ([0x01, 0x00, 0x00, 0xc0, 0x06, 0x09], 50),
+            ([0x00, 0x00, 0x00, 0x40, 0x06, 0x09], 2),
+            ([0x03, 0x00, 0x00, 0x28, 0x00, 0x0b], 95),
+            ([0x00, 0x00, 0x00, 0x00, 0x06, 0x09], 0),
+            ([0x00, 0x00, 0x00, 0x20, 0x06, 0x09], 0),
+            ([0x0f, 0xff, 0x00, 0xff, 0x06, 0xff], 504),
+        ] {
+            assert_eq!(block_anchor(&header), anchor, "{header:02x?}");
+        }
+    }
+
+    #[test]
+    fn test_ds2_qp_pause_block_frames_at_its_pointer() {
+        let mut pause = qp_block(0, 0, 9, 6, &stream_bytes(506, 506));
+        pause[..4].copy_from_slice(&[0x01, 0x00, 0x00, 0xe0]);
+        let data = qp_file(&[
+            qp_block(anchor_byte(0), 10, 0xff, 6, &stream_bytes(0, 506)),
+            pause,
+            qp_block(anchor_byte(52), 1, 0xff, 6, &stream_bytes(1012, 506)),
+        ]);
+        assert_eq!(qp_frames_of(&data), stream_frames(20));
+
+        let mut olympus = data.clone();
+        olympus[4 * DS2_BLOCK_SIZE..4 * DS2_BLOCK_SIZE + 6]
+            .copy_from_slice(&[0x00, anchor_byte(54), 9, 0xff, 6, 0xff]);
+        assert_eq!(qp_frames_of(&data), qp_frames_of(&olympus));
     }
 
     #[test]
