@@ -72,9 +72,9 @@ fn test_detect_grundig_sp() {
     assert_eq!(fmt.native_sample_rate(), 12000);
 }
 
-/// dss2wav's 3:4 polyphase FIR from 12 kHz to 16 kHz: 100 taps per phase,
+/// The 3:4 polyphase playback FIR from 12 kHz to 16 kHz: 100 taps per phase,
 /// one extra tap on phase 0, and 0xce zero samples of history.
-fn dss2wav_fir(inp: &[f64]) -> Vec<i16> {
+fn playback_fir(inp: &[f64]) -> Vec<i16> {
     use dss_codec::tables::grundig_sp::RESAMP;
     const HIST: usize = 0xce;
     let mut x = vec![0.0f64; HIST];
@@ -123,10 +123,9 @@ fn wav_samples(wav: &[u8]) -> Vec<i16> {
 fn test_decode_grundig_sp_bit_exact() {
     use std::io::Write;
 
-    // Decode the committed Grundig .dss sample to a 12 kHz WAV. dss2wav, the
-    // genuine Grundig decoder, made the 16 kHz reference with a 3:4 FIR after
-    // the same synthesis. Run that FIR over the decode and compare every
-    // sample with the reference.
+    // Decode the committed Grundig .dss sample to a 12 kHz WAV, run the 3:4
+    // playback FIR over the decode and compare every sample with the 16 kHz
+    // reference, which Grundig DigtaSoft One wrote from the same .dss file.
     let data = include_bytes!("fixtures/grundig_sample.dss");
     let reference = include_bytes!("fixtures/grundig_sample_16k.wav");
 
@@ -160,8 +159,8 @@ fn test_decode_grundig_sp_bit_exact() {
     let reference = wav_samples(reference);
     assert_eq!(reference.len(), 151 * 384);
     assert!(
-        dss2wav_fir(&pcm12) == reference,
-        "decode through the dss2wav FIR differs from the reference"
+        playback_fir(&pcm12) == reference,
+        "decode through the playback FIR differs from the reference"
     );
 
     let _ = std::fs::remove_file(&in_path);

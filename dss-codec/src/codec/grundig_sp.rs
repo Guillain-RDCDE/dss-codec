@@ -6,10 +6,10 @@
 //! lattice driven by an adaptive (pitch) plus fixed (algebraic) codebook
 //! excitation at 12 kHz and outputs 288 samples per frame at that rate.
 //!
-//! dss2wav lifts the 12 kHz signal to 16 kHz with a 3:4 polyphase FIR. That
-//! FIR is a playback step of the reference tool, not part of the codec, so
-//! this decoder stops at 12 kHz. Through that FIR the output is bit-exact
-//! with dss2wav on the Grundig sample set.
+//! Grundig DigtaSoft One lifts the 12 kHz signal to 16 kHz with a 3:4
+//! polyphase FIR. That FIR is not part of the codec, so this decoder stops
+//! at 12 kHz. Through that FIR the output is bit-exact with DigtaSoft One's
+//! 16 kHz output on the Grundig sample set.
 //!
 //! Olympus DSS and DS2 SP use the same frames. Their format 1 (variable
 //! rate) adds a leading type bit. A long frame (type 1) has a 2-bit last

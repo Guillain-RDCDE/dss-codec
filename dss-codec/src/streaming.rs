@@ -599,6 +599,7 @@ mod tests {
     fn make_ds2_header_only(mode: u8) -> Vec<u8> {
         let mut data = vec![0u8; 0x600 + 512];
         data[..4].copy_from_slice(b"\x03ds2");
+        data[0x600 + 1] = 3;
         // detect_ds2_format_type only trusts a block's mode byte when its
         // frame count is non-zero, as in every real recording
         data[0x600 + 2] = 1;
@@ -1448,27 +1449,37 @@ mod tests {
             assert!(!crate::decode_to_buffer(&plain).unwrap().samples.is_empty());
             let mut data = plain.clone();
             for block in 0..2 {
-                data[header_size + block * 512 + 3] = 0;
+                data[header_size + block * 512 + 4] = 5;
             }
             for chunk in [7, data.len()] {
                 assert!(
                     matches!(
                         stream_decode(&data, chunk),
-                        Err(DecodeError::UnsupportedCodec(0xff))
+                        Err(DecodeError::UnsupportedCodec(5))
                     ),
                     "{prefix:?} format {format}, chunk {chunk}"
                 );
             }
             assert!(matches!(
                 crate::decode_to_buffer(&data),
-                Err(DecodeError::UnsupportedCodec(0xff))
+                Err(DecodeError::UnsupportedCodec(5))
             ));
             let demuxed = if prefix[1..] == *b"ds2" {
                 demux_ds2(&data).map(|_| ())
             } else {
                 crate::demux::dss::demux_dss(&data).map(|_| ())
             };
-            assert!(matches!(demuxed, Err(DecodeError::UnsupportedCodec(0xff))));
+            assert!(matches!(demuxed, Err(DecodeError::UnsupportedCodec(5))));
+
+            let mut unset = plain.clone();
+            for block in 0..2 {
+                unset[header_size + block * 512 + 3] = 0;
+            }
+            assert_eq!(
+                crate::decode_to_buffer(&unset).unwrap().samples,
+                crate::decode_to_buffer(&plain).unwrap().samples,
+                "{prefix:?} format {format}, byte 3 not 0xff"
+            );
         }
     }
 

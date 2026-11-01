@@ -343,9 +343,17 @@ fn ds2_olympus_qp_byte3_mid() {
 
 #[test]
 fn ds2_olympus_qp_byte3_none() {
-    refuses("ds2/olympus-qp-byte3-none.ds2", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(255))
-    });
+    decodes(
+        "ds2/olympus-qp-byte3-none.ds2",
+        None,
+        &[(
+            16000,
+            48128,
+            AudioFormat::Ds2Qp,
+            6,
+            "c4d0fcd1e47d48b4ec8e85aed2fd7488",
+        )],
+    );
 }
 
 #[test]
@@ -359,6 +367,36 @@ fn ds2_olympus_qp_byte3_sp_first() {
             AudioFormat::Ds2Qp,
             6,
             "c4d0fcd1e47d48b4ec8e85aed2fd7488",
+        )],
+    );
+}
+
+#[test]
+fn ds2_olympus_qp_count19() {
+    decodes(
+        "ds2/olympus-qp-count19.ds2",
+        None,
+        &[(
+            16000,
+            176896,
+            AudioFormat::Ds2Qp,
+            6,
+            "759432a0076049d6de39b96df4bf5cf9",
+        )],
+    );
+}
+
+#[test]
+fn ds2_olympus_qp_count19_byte3() {
+    decodes(
+        "ds2/olympus-qp-count19-byte3.ds2",
+        None,
+        &[(
+            16000,
+            176896,
+            AudioFormat::Ds2Qp,
+            6,
+            "759432a0076049d6de39b96df4bf5cf9",
         )],
     );
 }
@@ -454,6 +492,21 @@ fn ds2_olympus_qp_pause_block() {
             AudioFormat::Ds2Qp,
             6,
             "c4d0fcd1e47d48b4ec8e85aed2fd7488",
+        )],
+    );
+}
+
+#[test]
+fn ds2_olympus_qp_philips_pause() {
+    decodes(
+        "ds2/olympus-qp-philips-pause.ds2",
+        None,
+        &[(
+            16000,
+            178944,
+            AudioFormat::Ds2Qp,
+            6,
+            "b4fe8e94e760538834711caf75e646ea",
         )],
     );
 }
@@ -834,10 +887,10 @@ fn ds2_paused_qp() {
         None,
         &[(
             16000,
-            92416,
+            90112,
             AudioFormat::Ds2Qp,
             6,
-            "83bdf85ecd892238f954d5c2a1621e84",
+            "294bb8fc3bb31ff141bc2aba74c15bac",
         )],
     );
 }
@@ -1013,6 +1066,21 @@ fn dss_olympus_lp_format4() {
 }
 
 #[test]
+fn dss_olympus_sp_byte2_ff() {
+    decodes(
+        "dss/olympus-sp-byte2-ff.dss",
+        None,
+        &[(
+            12000,
+            201600,
+            AudioFormat::DssSp,
+            0,
+            "33a6a13cc810dcd2200ea81d4b891aaa",
+        )],
+    );
+}
+
+#[test]
 fn dss_olympus_sp_byte3_mid() {
     decodes(
         "dss/olympus-sp-byte3-mid.dss",
@@ -1029,9 +1097,32 @@ fn dss_olympus_sp_byte3_mid() {
 
 #[test]
 fn dss_olympus_sp_byte3_none() {
-    refuses("dss/olympus-sp-byte3-none.dss", |e| {
-        matches!(e, DecodeError::UnsupportedCodec(255))
-    });
+    decodes(
+        "dss/olympus-sp-byte3-none.dss",
+        None,
+        &[(
+            12000,
+            36000,
+            AudioFormat::DssSp,
+            0,
+            "223897928c28b4a8edefd9938d518481",
+        )],
+    );
+}
+
+#[test]
+fn dss_olympus_sp_count19() {
+    decodes(
+        "dss/olympus-sp-count19.dss",
+        None,
+        &[(
+            12000,
+            198144,
+            AudioFormat::DssSp,
+            0,
+            "d4b91bb568bd390f9bc6ed37d8d68705",
+        )],
+    );
 }
 
 #[test]
@@ -1150,6 +1241,21 @@ fn dss_olympus_sp_pause_block() {
             AudioFormat::DssSp,
             0,
             "223897928c28b4a8edefd9938d518481",
+        )],
+    );
+}
+
+#[test]
+fn dss_olympus_sp_philips_pause() {
+    decodes(
+        "dss/olympus-sp-philips-pause.dss",
+        None,
+        &[(
+            12000,
+            201600,
+            AudioFormat::DssSp,
+            0,
+            "33a6a13cc810dcd2200ea81d4b891aaa",
         )],
     );
 }

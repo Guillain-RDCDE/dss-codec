@@ -3,18 +3,21 @@
 //! Grundig `\x06dss` files store the CELP bitstream in 512-byte blocks. Each
 //! block begins with a 6-byte header `[b0][b1][b2] ff 00 ff`; the remaining 506
 //! bytes are payload, stored as little-endian 16-bit words whose bits are read
-//! MSB-first. `b2` is the number of frames that *start* within the block. The
-//! first frame starts `b1*16 + (b0>>4)` bits from the start of the block. The
-//! demuxer takes off the 48 header bits to get the offset into the payload,
-//! and an offset that lands inside the header counts as 0. Frames are a
-//! continuous 328-bit (41-byte) stream; a frame may spill into the next block,
+//! MSB-first. `block_frames()` gives the number of frames that *start* within
+//! the block, and `block_start_bits()` how many bits from the start of the
+//! block the first of them starts. In this header that is `b1*16 + (b0>>4)`
+//! without its low 3 bits, since the first frame starts on a whole byte.
+//! The demuxer takes off the 48 header bits to get the offset into the payload.
+//! An offset that lands inside the header reaches back into the previous
+//! block when bit 3 of the pointer is set, and counts as 0 otherwise. Frames
+//! are a continuous 328-bit (41-byte) stream; a frame may spill into the next block,
 //! but each block's frames always start at that block's own first-frame offset.
 //!
 //! The whole audio region is buffered and demuxed at `finish`, because frame
 //! extraction needs each block's `frame_count` and the cross-block bit reads.
 
 use crate::demux::dss::{
-    block_frames, header_format, part_format, DssSpStreamDemuxer, TaggedFrames,
+    block_frames, block_start_bits, header_format, part_format, DssSpStreamDemuxer, TaggedFrames,
 };
 use crate::error::{DecodeError, Result};
 
@@ -61,15 +64,16 @@ fn grundig_frames(audio: &[u8]) -> (Vec<Vec<u8>>, bool) {
         if blk.len() < HEADER_SIZE {
             break;
         }
-        let mut first = blk[1] as isize * 16 + (blk[0] >> 4) as isize - (HEADER_SIZE * 8) as isize;
-        let mut count = blk[2] as usize;
-        if first < 0 && blk[0] & 0x80 != 0 && payload.is_empty() {
+        let mut first = block_start_bits(blk) as isize - (HEADER_SIZE * 8) as isize;
+        let mut count = block_frames(blk);
+        let back = block_start_bits(blk) & 8 != 0;
+        if first < 0 && back && payload.is_empty() {
             while first < 0 && count > 0 {
                 first += FRAME_BITS as isize;
                 count -= 1;
             }
         }
-        if first < 0 && (blk[0] & 0x80 == 0 || payload.is_empty()) {
+        if first < 0 && (!back || payload.is_empty()) {
             first = 0;
         }
         blocks.push((((payload.len() * 8) as isize + first) as usize, count));
@@ -277,10 +281,25 @@ mod tests {
             frames,
             vec![
                 frame_at(&bits, 0),
-                frame_at(&bits, 4048 + 164),
-                frame_at(&bits, 4048 + 492)
+                frame_at(&bits, 4048 + 160),
+                frame_at(&bits, 4048 + 488)
             ]
         );
+    }
+
+    #[test]
+    fn test_grundig_start_drops_the_low_3_bits_of_the_pointer() {
+        for top in 0u8..16 {
+            let data = [block(0x00, 3, 1, 1), block(top << 4, 13, 2, 2)].concat();
+            let bits = payload_bits(&data);
+            let start = 4048 + if top < 8 { 160 } else { 168 };
+            let expected = vec![
+                frame_at(&bits, 0),
+                frame_at(&bits, start),
+                frame_at(&bits, start + FRAME_BITS),
+            ];
+            assert_eq!(demux_grundig(&data).unwrap(), (expected, 3), "{top:x}");
+        }
     }
 
     #[test]
@@ -358,7 +377,7 @@ mod tests {
     #[test]
     fn test_grundig_strict_finish_accepts_block_boundary() {
         let long = [block(0x00, 3, 13, 1), block(0x80, 16, 1, 2)].concat();
-        let overstated = block(0x00, 3, 255, 1);
+        let overstated = block(0x00, 3, 13, 1);
         for audio in [&long[..BLOCK_SIZE], &overstated[..]] {
             let file = grundig_file(audio);
             let strict = stream_finish(&file, true).unwrap();
@@ -396,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_grundig_offset_into_header_starts_at_payload() {
-        for (b0, b1) in [(0x70, 2), (0x00, 0), (0x70, 1)] {
+        for (b0, b1) in [(0x70, 2), (0x10, 0), (0x70, 1)] {
             let data = block(b0, b1, 2, 1);
             let bits = payload_bits(&data);
 
@@ -408,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_grundig_swapped_start_before_the_payload() {
-        for (b0, b1, start) in [(0x80, 2, 8), (0xf0, 2, 1), (0xf0, 1, 17), (0x80, 0, 40)] {
+        for (b0, b1, start) in [(0x80, 2, 8), (0xf0, 2, 8), (0xf0, 1, 24), (0x80, 0, 40)] {
             let data = [block(0x00, 3, 0, 1), block(b0, b1, 2, 2)].concat();
             let bits = payload_bits(&data);
             let pos = 4048 - start;
@@ -476,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_grundig_overstated_count_stops_at_end_of_file() {
-        let data = block(0x00, 3, 255, 1);
+        let data = block(0x00, 3, 13, 1);
         let bits = payload_bits(&data);
 
         let (frames, total) = demux_grundig(&data).unwrap();
@@ -485,13 +504,54 @@ mod tests {
     }
 
     #[test]
-    fn test_grundig_overstated_count_reads_into_next_block() {
-        let data = [block(0x00, 3, 14, 1), block(0x80, 16, 1, 2)].concat();
+    fn test_grundig_count_ff_holds_no_frames() {
+        let data = [block(0x00, 3, 0xff, 1), block(0x00, 3, 2, 2)].concat();
         let bits = payload_bits(&data);
 
         let (frames, total) = demux_grundig(&data).unwrap();
-        assert_eq!(total, 15);
-        let mut expected = frames_from(&bits, 14);
+        assert_eq!(total, 2);
+        assert_eq!(frames, vec![frame_at(&bits, 4048), frame_at(&bits, 4048 + 328)]);
+    }
+
+    #[test]
+    fn test_grundig_start_from_byte3_when_pointer_is_0() {
+        let data = block(0x00, 0, 2, 1);
+        let bits = payload_bits(&data);
+
+        let (frames, total) = demux_grundig(&data).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(frames, vec![frame_at(&bits, 200), frame_at(&bits, 200 + 328)]);
+    }
+
+    #[test]
+    fn test_grundig_start_from_byte3_before_the_payload() {
+        for (byte3, start) in [(0x28u8, 8), (0x2f, 8), (0x18, 24), (0x08, 40)] {
+            let mut pause = block(0x00, 0, 2, 2);
+            pause[3] = byte3;
+            let data = [block(0x00, 3, 0, 1), pause.clone()].concat();
+            let bits = payload_bits(&data);
+            let pos = 4048 - start;
+            let expected = vec![frame_at(&bits, pos), frame_at(&bits, pos + FRAME_BITS)];
+            assert_eq!(demux_grundig(&data).unwrap(), (expected, 2), "{byte3:x}");
+        }
+        for byte3 in [0x20u8, 0x27, 0x10, 0x00] {
+            let mut pause = block(0x00, 0, 2, 2);
+            pause[3] = byte3;
+            let data = [block(0x00, 3, 0, 1), pause].concat();
+            let bits = payload_bits(&data);
+            let expected = vec![frame_at(&bits, 4048), frame_at(&bits, 4048 + FRAME_BITS)];
+            assert_eq!(demux_grundig(&data).unwrap(), (expected, 2), "{byte3:x}");
+        }
+    }
+
+    #[test]
+    fn test_grundig_overstated_count_reads_into_next_block() {
+        let data = [block(0x00, 10, 13, 1), block(0x80, 16, 1, 2)].concat();
+        let bits = payload_bits(&data);
+
+        let (frames, total) = demux_grundig(&data).unwrap();
+        assert_eq!(total, 14);
+        let mut expected: Vec<Vec<u8>> = (0..13).map(|k| frame_at(&bits, 112 + k * FRAME_BITS)).collect();
         expected.push(frame_at(&bits, 4048 + 216));
         assert_eq!(frames, expected);
     }

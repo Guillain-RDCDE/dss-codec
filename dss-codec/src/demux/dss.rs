@@ -22,15 +22,42 @@ const DSS_SP_SHORT_FRAME_SIZE: usize = 9;
 const DSS_SP_PACKET_BUF: usize = 48;
 const DSS_QP_FRAME_SIZE: usize = 56;
 const DSS_QP7_NOISE_FRAME_SIZE: usize = 12;
+const BLOCK_MAX_FRAMES: u8 = 13;
 
 pub(crate) type TaggedFrames = Vec<(u8, Vec<u8>)>;
 
+/// Frames that start in a block: byte 2, or byte 5 when byte 2 is 0 or 0xff,
+/// and none when that is 0xff. A block that states more than 13 holds none,
+/// which drops the DS-2600's splice blocks that state 19, except where the
+/// block's format counts, 0xff in byte 3, and is variable rate SP, LP or QP7,
+/// whose frames can be short enough for more to start in a block.
 pub(crate) fn block_frames(header: &[u8]) -> usize {
-    if header[2] != 0 || header[5] == 0xff {
-        header[2] as usize
+    let count = if header[2] != 0 && header[2] != 0xff {
+        header[2]
     } else {
-        header[5] as usize
+        header[5]
+    };
+    if count == 0xff
+        || (count > BLOCK_MAX_FRAMES && !(header[3] == 0xff && matches!(header[4], 1 | 2 | 4 | 7)))
+    {
+        0
+    } else {
+        count as usize
     }
+}
+
+/// Where the first frame that starts in a block starts, in bits from the
+/// block start: byte 1 and the top half of byte 0, or where both are 0, as in
+/// Philips's pause blocks, the bottom half of byte 0 and byte 3. The first
+/// frame starts on a whole byte, so this drops the low 3 bits of either.
+pub(crate) fn block_start_bits(header: &[u8]) -> usize {
+    let bits = usize::from(header[1]) << 4 | usize::from(header[0] >> 4);
+    let bits = if bits != 0 {
+        bits
+    } else {
+        usize::from(header[0] & 0x0f) << 8 | usize::from(header[3])
+    };
+    bits & !7
 }
 
 pub(crate) fn header_format(header: &[u8]) -> u8 {
@@ -267,9 +294,9 @@ impl DssSpWalker {
                 return Err(Short::PartEnd(raw));
             }
 
-            self.swap = header[0] & 0x80 != 0;
-            let mut cont =
-                2 * header[1] as isize + 2 * self.swap as isize - DSS_BLOCK_HEADER_SIZE as isize;
+            let start = (block_start_bits(header) >> 3) as isize;
+            self.swap = start & 1 != 0;
+            let mut cont = start + self.swap as isize - DSS_BLOCK_HEADER_SIZE as isize;
             if (cont < 0 && !self.swap) || cont > (DSS_BLOCK_SIZE - DSS_BLOCK_HEADER_SIZE) as isize
             {
                 cont = 0;
@@ -804,7 +831,7 @@ mod tests {
 
     #[test]
     fn test_dss_demux_overdeclared_frames_stop_at_end_of_file() {
-        let data = make_dss_file(&[make_dss_block(0, 3, 14, 0x20)]);
+        let data = make_dss_file(&[make_dss_block(0, 3, 13, 0x20)]);
 
         let (frames, total) = demux_dss(&data).unwrap();
         assert_eq!(total, 12);
@@ -849,6 +876,60 @@ mod tests {
     }
 
     #[test]
+    fn test_block_frames_reads_byte5_when_byte2_is_0_or_ff() {
+        for (header, frames) in [
+            ([0x0f, 0x03, 0x0a, 0xff, 0x06, 0x07], 10),
+            ([0x01, 0x00, 0x00, 0xc0, 0x06, 0x09], 9),
+            ([0x0f, 0x03, 0xff, 0xff, 0x06, 0x09], 9),
+            ([0x0f, 0x03, 0xff, 0xff, 0x06, 0xff], 0),
+            ([0x0f, 0x03, 0x00, 0xff, 0x06, 0xff], 0),
+            ([0x0f, 0x03, 0x00, 0xff, 0x06, 0x00], 0),
+        ] {
+            assert_eq!(block_frames(&header), frames, "{header:02x?}");
+        }
+    }
+
+    #[test]
+    fn test_block_frames_over_13_empties_sp_and_qp_blocks() {
+        for (header, frames) in [
+            ([0x0f, 0x04, 0x13, 0xff, 0x06, 0xff], 0),
+            ([0x0f, 0x03, 0x00, 0xff, 0x06, 0x13], 0),
+            ([0x0f, 0x03, 0x0e, 0xff, 0x00, 0xff], 0),
+            ([0x0f, 0x03, 0x0e, 0xff, 0x05, 0xff], 0),
+            ([0x0f, 0x03, 0x0d, 0xff, 0x06, 0xff], 13),
+            ([0x0f, 0x03, 0x0d, 0xff, 0x00, 0xff], 13),
+            ([0x0f, 0x0c, 0x1d, 0xff, 0x01, 0xff], 29),
+            ([0x0f, 0x03, 0x16, 0xff, 0x02, 0xff], 22),
+            ([0x0f, 0x03, 0x16, 0xff, 0x04, 0xff], 22),
+            ([0x0f, 0x04, 0x2a, 0xff, 0x07, 0xff], 42),
+            ([0x0f, 0x0c, 0x1d, 0x00, 0x01, 0xff], 0),
+            ([0x0f, 0x03, 0x16, 0x00, 0x02, 0xff], 0),
+            ([0x0f, 0x03, 0x16, 0x00, 0x04, 0xff], 0),
+            ([0x0f, 0x04, 0x2a, 0x00, 0x07, 0xff], 0),
+            ([0x01, 0x00, 0x00, 0xc0, 0x07, 0x13], 0),
+            ([0x0f, 0x04, 0x0d, 0x00, 0x06, 0xff], 13),
+        ] {
+            assert_eq!(block_frames(&header), frames, "{header:02x?}");
+        }
+    }
+
+    #[test]
+    fn test_dss_demux_pause_block_frames_at_its_pointer() {
+        for (byte3, frames, swap, byte1) in [(0x70u8, 6u8, 0u8, 23u8), (0x78, 11, 1, 23)] {
+            let mut pause = make_dss_block(0, 0, 0, 0x30);
+            pause[..6].copy_from_slice(&[0x01, 0x00, 0x00, byte3, 0x00, frames]);
+            let data = make_dss_file(&[pause]);
+            let olympus = make_dss_file(&[make_dss_block(swap, byte1, frames, 0x30)]);
+
+            let (expected, total) = demux_dss(&olympus).unwrap();
+            assert_eq!(total, usize::from(frames));
+            assert_eq!(demux_dss(&data).unwrap(), (expected.clone(), total));
+            let mut demuxer = DssSpStreamDemuxer::new(2, false);
+            assert_eq!(collect_frames(&mut demuxer, &data, 37), expected);
+        }
+    }
+
+    #[test]
     fn test_dss_demux_byte2_overrides_byte5() {
         let mut block = make_dss_block(0, 3, 1, 0x20);
         block[5] = 7;
@@ -861,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_dss_demux_pause_block_count_past_end_of_file() {
-        let data = make_dss_file(&[pause_block(3, 14, 0x20)]);
+        let data = make_dss_file(&[pause_block(3, 13, 0x20)]);
 
         let (frames, total) = demux_dss(&data).unwrap();
         assert_eq!(total, 12);
@@ -882,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_dss_stream_demux_truncated_frame() {
-        let data = make_dss_file(&[make_dss_block(0, 0, 20, 0x30)]);
+        let data = make_dss_file(&[make_dss_block(0, 0, 13, 0x30)]);
 
         let mut demuxer = DssSpStreamDemuxer::new(2, false);
         for chunk in data[..data.len() - 100].chunks(211) {
